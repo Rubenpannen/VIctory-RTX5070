@@ -123,6 +123,32 @@ impl Host {
         }
     }
 
+    /// The device's widest wave and whether it is an AMD RDNA card (waves of
+    /// 32 and 64), as the runtime reads them (`victory-gpu`'s host): what
+    /// [`super::set_host_max_wave`] and [`super::set_host_rdna`] are given
+    /// for translating as for this card. `None` if the device does not say.
+    pub fn waves(&self) -> Option<(u32, bool)> {
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: plain queries with valid out pointers.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o1).cast(),
+                    size_of_val(&o1) as u32,
+                )
+                .ok()?;
+            let amd = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+                .is_ok_and(|d| d.VendorId == 0x1002);
+            Some((
+                o1.WaveLaneCountMax,
+                amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64,
+            ))
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

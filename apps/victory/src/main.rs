@@ -91,7 +91,8 @@ enum Command {
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
-        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
+        /// cache and nothing else is done. The card's wave size is this
+        /// PC's (`VICTORY_HOST_WAVE` where there is none); set
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
@@ -204,10 +205,8 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
-                victory_shader::emit::set_host_max_wave(n);
-            }
+            // As for this PC's card, or `VICTORY_HOST_WAVE` / `VICTORY_HOST_RDNA`.
+            translate::host_waves();
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }

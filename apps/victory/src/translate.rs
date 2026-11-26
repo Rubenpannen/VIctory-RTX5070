@@ -233,6 +233,38 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     Ok(())
 }
 
+/// Sets the host wave size and float rules that offline translation is done
+/// for, as the runtime would on this PC:
+/// - `VICTORY_HOST_WAVE=<lanes>` (older name `VICTORY_HOST_MAX_WAVE`), e.g.
+///   32 for a card whose waves have at most 32 lanes;
+/// - `VICTORY_HOST_RDNA=1|0`: as for an AMD RDNA card or not
+///   (`VICTORY_RDNA_FLOAT`).
+///
+/// What is not set is taken from this PC's card. Without a card the wave
+/// size stays unknown (wave64 programs keep their form) and there are no
+/// RDNA rules. (`replay --retranslate` had 64 and RDNA fixed, and
+/// `translate` an unknown wave size: wave64 forms that NVIDIA refuses.)
+pub(crate) fn host_waves() {
+    let lanes = ["VICTORY_HOST_WAVE", "VICTORY_HOST_MAX_WAVE"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok()?.trim().parse::<u32>().ok());
+    let rdna = std::env::var_os("VICTORY_HOST_RDNA").map(|v| v == "1");
+    let card = (lanes.is_none() || rdna.is_none())
+        .then(|| Host::new(false).ok()?.waves())
+        .flatten();
+    let lanes = lanes.or(card.map(|c| c.0));
+    let rdna = rdna.or(card.map(|c| c.1)).unwrap_or(false);
+    if let Some(lanes) = lanes {
+        emit::set_host_max_wave(lanes);
+    }
+    emit::set_host_rdna(rdna);
+    eprintln!(
+        "translating for waves of up to {} lanes{}",
+        lanes.map_or("an unknown number of".to_owned(), |n| n.to_string()),
+        if rdna { ", RDNA float rules" } else { "" }
+    );
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -245,13 +277,6 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
-    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
-    // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
-        victory_shader::emit::set_host_max_wave(n);
-    }
-    // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
-    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
