@@ -2536,6 +2536,10 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Constant buffers that copies at their place write, filled on the card
+    /// at their place (`place::HostList::placed_constants`): by address,
+    /// bytes and the copy's step.
+    placed_constants: std::collections::HashMap<(usize, u32, usize), ID3D12Resource>,
 }
 
 impl Deferred {
@@ -3985,11 +3989,12 @@ fn late_line(frames: f64) {
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.2} constant buffers filled on the card behind such a copy (VICTORY_PLACED_CONSTANTS=0: at submission)",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            place::STATS_CONSTANTS.swap(0, Ordering::Relaxed) as f64 / frames,
         );
     }
     card_steps::log(frames);

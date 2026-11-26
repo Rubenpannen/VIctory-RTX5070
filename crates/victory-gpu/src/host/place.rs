@@ -52,6 +52,10 @@ const MOST: usize = 8 << 20;
 /// out of a host copy, and texture copies out of one.
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line: constant buffers filled on the card at
+/// their place behind a copy at its place ([`HostList::placed_constants`]).
+pub(super) static STATS_CONSTANTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
     pub(super) dst: usize,
@@ -68,6 +72,22 @@ impl Placed {
     pub(super) fn waits(&self, written: &[(usize, usize)]) -> Waits {
         let source = touches(written, self.src, self.src + self.len);
         if source && self.from.is_some() {
+            #[cfg(feature = "diagnostics")]
+            {
+                static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if SEEN.fetch_add(1, Ordering::Relaxed) < 20 {
+                    let (start, n) = self.shadow.span();
+                    tracing::info!(
+                        dst = format_args!("{:#x}", self.dst),
+                        src = format_args!("{:#x}", self.src),
+                        len = self.len,
+                        dst_copy = format_args!("{start:#x}+{n:#x}"),
+                        src_title_buffer = ?crate::shadow::peek(self.src as u64, self.len as u64).map(|s| (s.span(), s.written(), s.in_place())),
+                        src_exact = ?crate::shadow::peek_exact(self.src as u64, self.len as u64).map(|s| s.span()),
+                        "a copy at its place takes its source out of upload memory, and flights write that source: it waits for them"
+                    );
+                }
+            }
             return Waits::Yes;
         }
         match source || touches(written, self.dst, self.dst + self.len) {
@@ -233,7 +253,21 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
-    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && !s.in_place())
+    crate::shadow::peek(src as u64, len as u64)
+        .filter(|s| s.written() && !s.in_place())
+        .or_else(|| placed_exact().then(|| crate::shadow::peek_exact(src as u64, len as u64)).flatten())
+}
+
+/// Whether a copy's source that shaders write through a copy of a single
+/// view's own bytes (`crate::shadow::exact`) is copied out of that copy on
+/// the card (`VICTORY_PLACED_EXACT=0`: out of upload memory the CPU fills at
+/// submission, as before). The title copies 240 bytes a frame out of such a
+/// view that a dispatch in the air writes: from upload memory the submission
+/// waited for every flight to land first, 36 ms a frame on the RTX 5070 at
+/// 1080p (the card-steps line: "a copy at its place waits for flights").
+fn placed_exact() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_EXACT").is_none_or(|v| v != "0"))
 }
 
 impl HostList {
@@ -331,6 +365,64 @@ impl HostList {
             wait_for_all(host, &self.list);
         }
         Some(between)
+    }
+
+    /// For a table's constant buffer of `size` bytes at `address` that a copy
+    /// at its place earlier in this list writes all of: a buffer on the card
+    /// that holds those bytes at this place of the list, and its address
+    /// (`VICTORY_PLACED_CONSTANTS=0`: none, the constant buffer is filled out
+    /// of title memory at submission, as before).
+    ///
+    /// The title copies 560 bytes out of memory a dispatch writes (its big
+    /// heap) to a constant buffer a few draws read, a few times a frame. The
+    /// copy is done here; the fill of the constants was done on the CPU at
+    /// submission, so it read what the copy writes before the card had
+    /// written it, and the whole submission waited for every flight to land
+    /// (`card_steps`: "a copy at its place waits for flights"): 36 ms a frame
+    /// of the submitting thread on the RTX 5070 at 1080p.
+    ///
+    /// shortcut: kept per list for the copy that wrote it; a shader that
+    /// writes the constants between two draws that read them is not seen.
+    pub(crate) fn placed_constants(&self, address: u64, size: u32) -> Option<(ID3D12Resource, u64)> {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !on() || !*ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_CONSTANTS").is_none_or(|v| v != "0")) {
+            return None;
+        }
+        let (at, n) = (address as usize, size as usize);
+        let (step, shadow) = {
+            let deferred = self.deferred();
+            let (step, p) = deferred.copies.iter().enumerate().rev().find_map(|(i, s)| match s {
+                Step::Placed(p) if p.dst < at + n && at < p.dst + p.len => Some((i, p)),
+                _ => None,
+            })?;
+            // Partly: as before.
+            if at < p.dst || at + n > p.dst + p.len {
+                return None;
+            }
+            if let Some(made) = deferred.placed_constants.get(&(at, size, step)) {
+                // SAFETY: a live buffer.
+                return Some((made.clone(), unsafe { made.GetGPUVirtualAddress() }));
+            }
+            (step, p.shadow.clone())
+        };
+        let host = host()?;
+        let between = self.between(host, u64::from(size).next_multiple_of(256))?;
+        // SAFETY: an open list; live buffers (the list holds both), ranges
+        // inside them.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&between, 0, &shadow.buffer, shadow.offset(address), u64::from(size));
+            self.list.ResourceBarrier(&[transition(
+                &between,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            )]);
+        }
+        STATS_CONSTANTS.fetch_add(1, Ordering::Relaxed);
+        self.deferred().placed_constants.insert((at, size, step), between.clone());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { between.GetGPUVirtualAddress() };
+        Some((between, gpu))
     }
 
     /// A buffer on the card for this recording alone.

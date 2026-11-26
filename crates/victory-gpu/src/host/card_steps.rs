@@ -477,8 +477,43 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     }
     // (Asked with no list's lock held: `read_by` takes each in turn.)
     for i in for_readers {
-        if let Does::Placed { dst, len, ref mut asked, .. } = does[i] {
+        if let Does::Placed { dst, src, len, ref mut asked } = does[i] {
             *asked = place::read_by(runs, &[(dst, dst + len)]);
+            // (Only the diagnostics line below names the source.)
+            let _ = src;
+            #[cfg(feature = "diagnostics")]
+            if *asked {
+                static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    let readers: Vec<String> = does
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(j, d)| match *d {
+                            Does::Fill { src: s, len: n, asked, to } if meet((s, s + n), (dst, dst + len)) => {
+                                Some(format!("fill #{j} {s:#x}+{n:#x} asked {asked} to_card {to} same_list {}", steps.get(j).map(|s| s.0) == steps.get(i).map(|s| s.0)))
+                            }
+                            Does::Copy { dst: d2, src: s, len: n, .. } if meet((s, s + n), (dst, dst + len)) => {
+                                Some(format!("copy #{j} {s:#x}->{d2:#x}+{n:#x}"))
+                            }
+                            Does::Read { from, to, .. } if meet((from, to), (dst, dst + len)) => {
+                                Some(format!("read #{j} {from:#x}..{to:#x}"))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    tracing::info!(
+                        placed = i,
+                        dst = format_args!("{dst:#x}"),
+                        src = format_args!("{src:#x}"),
+                        len,
+                        written_src = touches(written, src, src + len),
+                        written_dst = touches(written, dst, dst + len),
+                        ?readers,
+                        steps = does.len(),
+                        "a copy at its place waits for flights: a step behind it reads what it writes on the CPU"
+                    );
+                }
+            }
         }
     }
     (does, steps)
@@ -500,14 +535,49 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
     let (does, steps) = does_of(&written, runs);
+    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
+    // A copy at its place that waits only because a step of a later list
+    // reads what it writes on the CPU: [`plan`] refuses it before it gets
+    // to [`BEHIND_PLACED`] ("a copy at its place waits for flights"), so it
+    // is looked for here. On the RTX 5070 the title copies 240, 3,424 and
+    // 32,304 bytes out of its heap, which a dispatch in the air writes, to
+    // constant buffers that draws of later lists read (fills): the whole
+    // submission waited 30-36 ms a frame for the flights.
+    if let Some((placed, reader)) = placed_read_later(&does, &steps) {
+        let cut = place(placed)? + 1;
+        return (place(reader)? >= cut).then_some(cut);
+    }
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
     }
     let (placed, reader) = behind?;
-    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     let cut = place(placed)? + 1;
     (place(reader)? >= cut).then_some(cut)
+}
+
+/// The first copy at its place that waits for its readers ([`Does::Placed`],
+/// asked) and the first step behind it that reads what it writes on the CPU,
+/// if that one is of another list; `None` if there is none, or if the first
+/// reader is of the copy's own list (a cut cannot help it). `steps`: each
+/// step's list by address.
+fn placed_read_later(does: &[Does], steps: &[(usize, usize)]) -> Option<(usize, usize)> {
+    let reads = |d: &Does, to: (usize, usize)| match *d {
+        Does::Fill { src, len, .. } => meet((src, src + len), to),
+        Does::Copy { dst, src, len, .. } => meet((src, src + len), to) || meet((dst, dst + len), to),
+        Does::Read { from, to: end, .. } => meet((from, end), to),
+        _ => false,
+    };
+    for (p, d) in does.iter().enumerate() {
+        let Does::Placed { dst, len, asked: true, .. } = *d else {
+            continue;
+        };
+        let Some(r) = (p + 1..does.len()).find(|&j| reads(&does[j], (dst, dst + len))) else {
+            continue;
+        };
+        return (steps.get(r)?.0 != steps.get(p)?.0).then_some((p, r));
+    }
+    None
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:

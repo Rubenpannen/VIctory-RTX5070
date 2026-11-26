@@ -5765,6 +5765,20 @@ static EXACT_SWEEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 struct Pooled(u64, ID3D12Resource, usize);
 static EXACT_BUFFERS: Mutex<Vec<Pooled>> = Mutex::new(Vec::new());
 
+/// The copy of a single view's own bytes ([`exact`]) that holds `[address,
+/// address + len)` and that shaders write, if one was made.
+pub(crate) fn peek_exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let holds = |&(start, n): &(u64, u64), s: &Arc<Shadow>| start + n >= end && s.written() && s.place.is_none();
+    if exact_pool() {
+        let map = EXACT_MAP.read().unwrap_or_else(|e| e.into_inner());
+        map.range(..=(address, u64::MAX)).rev().take(16).find(|(k, (s, _))| holds(k, s)).map(|(_, (s, _))| s.clone())
+    } else {
+        let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1.range(..=(address, u64::MAX)).rev().take(16).find(|(k, (s, _))| holds(k, s)).map(|(_, (s, _))| s.clone())
+    }
+}
+
 fn exact_hit(address: u64, len: u64, now: u64) -> Option<Arc<Shadow>> {
     let map = EXACT_MAP.read().unwrap_or_else(|e| e.into_inner());
     let (shadow, used) = map.get(&(address, len))?;
