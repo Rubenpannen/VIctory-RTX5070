@@ -3,8 +3,11 @@
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
-# -Display      the display mode the title is told it is plugged into: 'monitor' (the default, this
-#               PC's main screen, e.g. 2560x1440), 'console' (3840x2160, as before) or WxH
+# -Display      the title's output size (VICTORY_OUTPUT): 2560x1440 (the default), 1920x1080,
+#               1664x936, 1280x720, 'monitor' (this PC's main screen, if it is one of those or
+#               3840x2160) or 'console' (left alone: 3840x2160, as the dump's settings say)
+# -RenderScale  the title's own upscaler's scale (VICTORY_RENDER_SCALE, Series X): 1.0 (the
+#               default: it renders at the output size), 0.5 to 1.0, or 'title' (its own 2/3)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Log          also write the whole log to <data_dir>\logs\play-<date>-<time>.log (data_dir from
 #               victory.toml or VICTORY_DATA_DIR); -LogFile <path> writes it there instead. The log
@@ -15,7 +18,9 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidatePattern('^(monitor|console|\d{3,4}[xX]\d{3,4})$')][string]$Display = 'monitor',
+    [ValidateSet('2560x1440', '1920x1080', '1664x936', '1280x720', '3840x2160', 'monitor', 'console')]
+    [string]$Display = '2560x1440',
+    [ValidatePattern('^(title|0\.[5-9]\d*|1(\.0*)?)$')][string]$RenderScale = '1.0',
     [hashtable]$More = @{},
     [switch]$Log,
     [string]$LogFile = ''
@@ -38,14 +43,22 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+# The title takes its output size from its own settings (3840x2160 in a Series X dump), not from
+# the display mode it is told of: VICTORY_OUTPUT patches it to one of the sizes it has a mode for.
+$modes = '3840x2160', '2560x1440', '1920x1080', '1664x936', '1280x720'
+$output = $Display
 if ($Display -eq 'monitor') {
     # In real pixels (unlike Windows.Forms, which a window without DPI awareness gets scaled).
     $screen = Get-CimInstance Win32_VideoController | Where-Object CurrentHorizontalResolution | Select-Object -First 1
-    if ($screen) { $settings.VICTORY_DISPLAY_MODE = "$($screen.CurrentHorizontalResolution)x$($screen.CurrentVerticalResolution)" }
-} elseif ($Display -ne 'console') {
-    $settings.VICTORY_DISPLAY_MODE = $Display
+    $size = if ($screen) { "$($screen.CurrentHorizontalResolution)x$($screen.CurrentVerticalResolution)" }
+    $output = if ($size -in $modes) { $size } else { '2560x1440' }
+    if ($size -notin $modes) { Write-Host "This screen ($size) is no size the title has a mode for: $output." }
 }
-if ($settings.VICTORY_DISPLAY_MODE) { Write-Host "Display mode told to the title: $($settings.VICTORY_DISPLAY_MODE)" }
+if ($output -ne 'console') { $settings.VICTORY_OUTPUT = $output }
+if ($RenderScale -ne 'title') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
+$shown = if ($output -eq 'console') { 'the title''s own (3840x2160)' } else { $output }
+$scale = if ($RenderScale -eq 'title') { 'its own 2/3' } else { $RenderScale }
+Write-Host "Output size: $shown; render scale: $scale"
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

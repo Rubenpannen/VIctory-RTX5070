@@ -55,7 +55,8 @@ Running the title: `scripts\play.ps1 -Exe <title exe>` sets this fork's set of `
 switches (clearing other `VICTORY_*` vars except the path ones) and runs
 `target\diag\victory.exe run <exe> --execute` from the repo root, where `victory.toml` is looked for.
 `-Safe` drops the newest switches, `-RayTracing` sets `VICTORY_BVH_BUILDER=1`, `-Display` sets
-`VICTORY_DISPLAY_MODE`, `-More @{...}` adds switches. Ahead of a run: `victory shaders <archives>`
+the title's output size (`VICTORY_OUTPUT`, 2560x1440 by default), `-RenderScale` its upscaler's scale
+(`VICTORY_RENDER_SCALE`, 1.0 by default), `-More @{...}` adds switches. Ahead of a run: `victory shaders <archives>`
 (translate every shader into the cache) and `victory warm --used` (pre-build host pipelines for the
 driver's cache). Other subcommands (`inspect`, `census`, `translate`, `replay`, `config`, ...) are in
 `apps/victory/src/main.rs`.

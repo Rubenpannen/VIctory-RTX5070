@@ -79,8 +79,12 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-`-Display` sets the display mode the title is told it is plugged into: `monitor`
-(the default, this PC's main screen), `console` (3840x2160) or `WxH`.
+The title renders for 2560x1440 at full scale by default (`VICTORY_OUTPUT=2560x1440`,
+`VICTORY_RENDER_SCALE=1.0`; left alone it renders 2560x1440 and scales it up to
+3840x2160). `-Display` picks the output size: `1920x1080`, `1664x936`, `1280x720`,
+`3840x2160`, `monitor` (this PC's main screen, if the title has a mode for it) or
+`console` (the title's own). `-RenderScale` picks the scale its upscaler renders at
+(0.5 to 1.0, or `title` for its own 2/3).
 `-Log` also writes the whole log to `<data_dir>\logs\play-<date>-<time>.log`
 (`-LogFile <path>` elsewhere, outside this folder: it holds the title's data).
 
