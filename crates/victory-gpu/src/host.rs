@@ -617,7 +617,35 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        release_later(done);
+    }
+}
+
+/// Drops `what` on a thread of its own (`victory-release`): releasing a
+/// D3D12 resource is a kernel call, and [`bury`] runs on the submitting and
+/// landing threads; upstream measured ~5 % of the title's submitting thread
+/// in releases (Marvisak 3e10052c, Marvis). Only for objects no GPU work in
+/// flight uses, as [`bury`]'s are. `VICTORY_RELEASE_THREAD=0`: dropped in
+/// place, as before.
+fn release_later(what: Vec<(u64, Retired)>) {
+    type Release = std::sync::mpsc::Sender<Vec<(u64, Retired)>>;
+    static RELEASE: OnceLock<Option<Release>> = OnceLock::new();
+    if !crate::toggled!("VICTORY_RELEASE_THREAD") {
+        drop(what);
+        return;
+    }
+    let release = RELEASE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-release".into())
+            .spawn(move || rx.into_iter().for_each(drop))
+            .ok()
+            .map(|_| tx)
+    });
+    match release {
+        // (A failed send hands the objects back, and they drop here.)
+        Some(release) => drop(release.send(what)),
+        None => drop(what),
     }
 }
 

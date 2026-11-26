@@ -2117,6 +2117,23 @@ pub(super) fn wave_ticket_prologue(s: &mut Shader, slot: u32, wave: u32) -> V {
     s.m.bin(joined, Bin::Add, base, lane)
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes.
+fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Address], lowest: u32) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below { lowest } else { lowest.max(code_end & !3) }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2174,9 +2191,9 @@ impl<'a> Lower<'a> {
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
-            // masks), nor when LDS may be shared within the console wave without barriers (a
+            // console wave (lanes 32k..32k+31); `ds_bpermute` too, which permutes within 32-lane
+            // halves. Not when it crosses halves (`v_mbcnt`, `v_readlane`, `v_writelane`,
+            // `ds_permute`, masks as numbers or lane-constant masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
@@ -2184,7 +2201,6 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -2244,8 +2260,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -2493,22 +2509,22 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -5799,6 +5815,17 @@ impl<'a> Lower<'a> {
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
+            // A source lane EXEC leaves out reads 0 (Marvisak b51011aa, its
+            // pull request #1582 by Capt-Speed): zeroed before it is read.
+            // shortcut: as for `ds_bpermute`, a lane that left through a
+            // branch is read as the host gives it.
+            let x = match guard {
+                Some(g) => {
+                    let z = self.s.m.i32(0);
+                    self.s.m.select(c, g, x, z)
+                }
+                None => x,
+            };
             let lane = self.lane_index();
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
             let src = if offset & 0x8000 != 0 {
@@ -5838,27 +5865,35 @@ impl<'a> Lower<'a> {
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
             // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
+            // within its own 32 lanes: wave64 permutes lanes 0..31 and 32..63
+            // independently (RDNA 2 ISA, section 10.4.4; Marvisak 0665a0e8,
+            // its pull request #573 by QB). A source lane outside EXEC gives
+            // 0. (the title's checkerboard shadow-mask generators read their
             // neighbours' samples with it; without them every shadowed light
             // was multiplied by an empty mask.)
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
+            // (A console wave of 64 run as host waves of 32 holds one half in
+            // each, so the permute stays inside the host wave.)
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let mask31 = self.s.m.i32(31);
+            let within = self.s.m.bin(c, Bin::And, src, mask31);
+            let src = if self.x.native.wave64 && self.s.wave_size != Some(32) {
+                // a host wave of 64: this lane's half
+                let me = self.lane_index();
+                let not31 = self.s.m.i32(!31);
+                let base = self.s.m.bin(c, Bin::And, me, not31);
+                self.s.m.bin(c, Bin::Or, base, within)
+            } else {
+                within
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -8709,7 +8744,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -8722,8 +8757,15 @@ impl<'a> Lower<'a> {
     }
 
     /// DPP: src0 as read from another lane, and which lanes write their
-    /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    /// result (none: all). `guard`: the lanes EXEC narrows the instruction to.
+    ///
+    /// A source lane EXEC leaves out, unless `fi` (fetch inactive) is set,
+    /// gives 0 under DPP8 and DPP16 with `bound_ctrl`, and leaves the
+    /// destination lane unwritten under DPP16 without it (Marvisak b51011aa,
+    /// its pull request #1582 by Capt-Speed). shortcut: as for
+    /// `ds_bpermute`, a lane that left through a branch rather than a guard
+    /// is read as the host gives it.
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -8812,22 +8854,48 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
-        } else if let Dpp::Row { ctrl, .. } = dpp
-            && self.helpers_read(quad)
-        {
-            self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
-        } else {
-            self.read_lane(x, src)
+        // `v` as this lane's source lane holds it.
+        let fetch = |l: &mut Self, v: V| {
+            if mesh_quad {
+                l.quad_pick(v, src)
+            } else if let Dpp::Row { ctrl, .. } = dpp
+                && l.helpers_read(quad)
+            {
+                l.quad_read(v, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
+            } else {
+                l.read_lane(v, src)
+            }
         };
-        let mut enable = None;
+        let (fi, bound) = match dpp {
+            Dpp::Lanes { fi, .. } => (fi, true),
+            Dpp::Row { fi, bound_ctrl, .. } => (fi, bound_ctrl),
+        };
+        let mut source_on = None;
+        let x = match guard {
+            Some(g) if !fi && bound => {
+                let z = k(self, 0);
+                self.s.m.select(c, g, x, z)
+            }
+            Some(g) if !fi => {
+                let (one, z) = (k(self, 1), k(self, 0));
+                let on = self.s.m.select(c, g, one, z);
+                let on = fetch(self, on);
+                source_on = Some(self.s.m.cmp(c, pred::NE, on, z));
+                x
+            }
+            _ => x,
+        };
+        let mut r = fetch(self, x);
+        let mut enable = source_on;
         if let Some(inside) = inside {
             if zero {
                 let z = k(self, 0);
                 r = self.s.m.select(c, inside, r, z);
             } else {
-                enable = Some(inside);
+                enable = Some(match enable {
+                    Some(e) => self.s.m.bin(c, Bin::And, e, inside),
+                    None => inside,
+                });
             }
         }
         if let Some((rows, banks)) = masks {
@@ -13784,7 +13852,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -13949,6 +14017,31 @@ mod tests {
         assert_eq!(at(3, 7), None);
         // A row no element holds gives nothing, as before.
         assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
+    }
+
+    /// A program's constant table starts after its instructions, unless a
+    /// load at a fixed offset reads below that.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        // A load at a computed offset from the code's start: the table is
+        // the constants only, not the whole program.
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        // A load at a fixed offset inside the instructions keeps the start.
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        // Loads past the instructions only: from the lowest of them.
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
     }
 
     /// Whether a synthetic compute program translates with these input registers.
