@@ -301,8 +301,17 @@ impl HostList {
         let at = to.offset(dst as u64);
         // What the title's CPU wrote around and under it so far goes first.
         to.refresh(self, dst as u64, len as u64);
-        // SAFETY (both): an open list; live buffers (the list holds the
+        let (common, source, dest) =
+            (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        // SAFETY (all): an open list; live buffers (the list holds the
         // copies and its scratch memory), ranges inside them.
+        // Host copies are in the common state here and promoted by the
+        // copy's use of them; each is put back in it after, as the steps
+        // behind expect. The destination was left in `COPY_DEST`, where the
+        // next copy out of it, a constant buffer filled from it
+        // (`placed_constants`) and the compare of host copies in the card's
+        // memory after the lists (a root view, in the same submission) read
+        // it: 19,500 debug-layer errors in a 7-minute run.
         unsafe { wait_for_all(host, &self.list) };
         match (&own, &scratch) {
             (Some(from), _) => {
@@ -314,12 +323,19 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        self.list.ResourceBarrier(&[
+                            transition(&between, dest, source),
+                            // (A promoted read state is not promoted to a write.)
+                            transition(&from.buffer, source, dest),
+                        ]);
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
                 } else {
-                    unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
+                    unsafe {
+                        self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64);
+                        self.list.ResourceBarrier(&[transition(&from.buffer, source, common)]);
+                    }
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
@@ -328,7 +344,10 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        unsafe {
+            self.list.ResourceBarrier(&[transition(&to.buffer, dest, common)]);
+            wait_for_all(host, &self.list);
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -361,7 +380,10 @@ impl HostList {
         unsafe {
             wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            self.list.ResourceBarrier(&[
+                transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            ]);
             wait_for_all(host, &self.list);
         }
         Some(between)
@@ -412,11 +434,10 @@ impl HostList {
         unsafe {
             wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &shadow.buffer, shadow.offset(address), u64::from(size));
-            self.list.ResourceBarrier(&[transition(
-                &between,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-            )]);
+            self.list.ResourceBarrier(&[
+                transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+                transition(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            ]);
         }
         STATS_CONSTANTS.fetch_add(1, Ordering::Relaxed);
         self.deferred().placed_constants.insert((at, size, step), between.clone());
