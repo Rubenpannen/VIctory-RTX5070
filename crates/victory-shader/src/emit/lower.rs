@@ -1305,7 +1305,7 @@ thread_local! {
 /// 32..63 by half. Right for code that only relies on what HLSL's wave
 /// operations promise; a program that takes one wave to be its whole
 /// thread group gets per-half results. The last resort for programs that
-/// do not translate otherwise, and only with `VICTORY_WAVE_LOCAL=any`.
+/// do not translate otherwise (`VICTORY_WAVE_LOCAL=idiom`: not at all).
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_ANY.replace(true);
     let r = with_local_waves(f);
@@ -1328,8 +1328,8 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// shortcut: where a count or sum goes is not checked. A program that uses
 /// a wave-wide result as data for the whole console wave (a tile's maximum,
 /// say, with one wave per thread group) gets its half's result. It is used
-/// only for programs that do not translate otherwise; outside the idiom only
-/// with `VICTORY_WAVE_LOCAL=any`.
+/// only for programs that do not translate otherwise; outside the idiom not
+/// with `VICTORY_WAVE_LOCAL=idiom`.
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_WAVES.replace(true);
     let r = f();

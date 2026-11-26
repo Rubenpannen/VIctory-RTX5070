@@ -59,8 +59,11 @@ in that order of size:
   hung in a run of indirect dispatches of compute 2561af9577c47289, 15 s after its first
   one. That wave64 program uses a count over the wave as data and translated only with
   each 32-lane half as a wave of its own, which is approximate. Runs that refused it
-  (`VICTORY_WAVE_LOCAL=idiom`) ran without a loss. The approximate forms are now off;
-  `VICTORY_WAVE_LOCAL=any` brings them back.
+  (`VICTORY_WAVE_LOCAL=idiom`) ran without a loss. Refusing every approximate form
+  instead brought back blocky patches in the character shadows, so the forms stay on and
+  `scripts\play.ps1` skips that one program (`VICTORY_SKIP_PIPELINES`, diagnostics
+  builds). 13 of the 16 approximate programs fail the exact form for the same reason
+  ("a count or sum over the wave used as data"), so the translator cannot single it out.
 - **A rare lost write** (6 of 200 runs of a stress test): a view was mapped between our
   look at its guards and our lock, and views were opened one after another. None in 603
   runs after.

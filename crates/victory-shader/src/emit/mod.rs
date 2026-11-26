@@ -476,16 +476,15 @@ pub fn emit(
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
         // Where the wave operations are the allocation idiom
-        // ([`lower::wave_local`]) that is exact. Other programs are refused
-        // (as with `VICTORY_WAVE_LOCAL=idiom`); `VICTORY_WAVE_LOCAL=any`
-        // takes them the same way last of all, each half-wave giving its own
-        // results (approximate: a tile-wide result becomes two half-tile
-        // ones), as before. Off by default since the device loss of
-        // 2026-11-26: compute 2561af9577c47289, which uses a count over the
-        // wave as data, translated only that way, and 15 s after its first
-        // dispatch the card hung in it (DXGI_ERROR_DEVICE_HUNG); runs that
-        // refused it did not lose the card.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "any");
+        // ([`lower::wave_local`]) that is exact. Other programs are taken
+        // the same way last of all, each half-wave giving its own results
+        // (approximate: a tile-wide result becomes two half-tile ones);
+        // `VICTORY_WAVE_LOCAL=idiom` refuses those instead (`any`: as unset).
+        // Refusing them all drops the title's character shadows (blocky
+        // patches on skin, 2026-11-26); taking them all lost the card in one
+        // of them, compute 2561af9577c47289 (DXGI_ERROR_DEVICE_HUNG 15 s after
+        // its first dispatch), which `scripts\play.ps1` skips by its hash.
+        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
