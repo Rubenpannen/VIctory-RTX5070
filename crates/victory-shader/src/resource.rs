@@ -1129,8 +1129,20 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
-        // Only the lanes that reach the access read the descriptor.
+        // Only the lanes that reach the access read the descriptor, and of those only the ones
+        // its guard lets run it: a program without its early-outs (`ir::without_early_outs`)
+        // walks the lanes that would have left through the body with EXEC clear, where they
+        // reach every block but run nothing. A sampler built in a skip whose other way holds
+        // no descriptor (`alphaResolve:CS_AlphTransmissionPrefilterMip`, 0x4a0-0x4d0: the
+        // registers hold EXEC masks there) is then still the only one a running lane can
+        // have come by, as it was with the early-out.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        if let Some(l) = self.lanes
+            && let Some(i) = self.p.blocks[at].insts.iter().position(|x| std::ptr::eq(x, inst))
+            && let Some(&Some(guard)) = l.guards.get(at).and_then(|g| g.get(i))
+        {
+            known.push((guard, true));
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 

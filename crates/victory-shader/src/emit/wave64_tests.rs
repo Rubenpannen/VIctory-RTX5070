@@ -622,26 +622,7 @@ fn an_lds_counter_inside_a_lane_branch_is_two_host_waves_with_the_branches_wave_
         cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
     }
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let wave_of = |wide: &HashSet<usize>| -> (Option<u32>, Vec<u8>) {
-        let st = structure::structure_wide(&p, wide).expect("structure");
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-        let io = io::raise(&p, &native).expect("io::raise");
-        let was = lower::TEST_HOST_WAVE.replace(Some(32));
-        let lowered = lower::lower_counted(&lower::Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-        }, false);
-        lower::TEST_HOST_WAVE.set(was);
-        let lowered = lowered.expect("lower");
-        (lowered.wave_size, lowered.dxil)
-    };
+    let wave_of = |wide: &HashSet<usize>| wave_and_dxil(&native, &p, wide);
     // per lane: 64-lane waves, and the lowering names the blocks the waves cannot meet in
     lower::take_needs();
     assert_eq!(wave_of(&HashSet::new()).0, Some(64));
@@ -663,6 +644,133 @@ fn an_lds_counter_inside_a_lane_branch_is_two_host_waves_with_the_branches_wave_
         assert_eq!(got, expected, "{below} threads in the branch");
     }
     eprintln!("ran on the hardware device: the max of both halves in every case");
+}
+
+/// The wave size `p` (of `native`) is lowered for on a host of 32-lane waves, with the branches
+/// closing `wide` taken wave-wide, and its DXIL.
+fn wave_and_dxil(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> (Option<u32>, Vec<u8>) {
+    let st = structure::structure_wide(p, wide).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower_counted(
+        &lower::Parts {
+            native,
+            p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        },
+        false,
+    );
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.expect("lower");
+    (lowered.wave_size, lowered.dxil)
+}
+
+/// A group of one console wave (64 threads, which keeps its LDS order without barriers) with
+/// 512 bytes of LDS, `body` after the prologue of [`native_of`]; lowered for a host of 32-lane
+/// waves, which must give waves of 32 and DXIL the validator takes. The host shader.
+fn one_console_wave(body: &[u32]) -> HostShader {
+    let mut native = native_of(body, true, 64);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let (wave, mut dxil) = wave_and_dxil(&native, &p, &HashSet::new());
+    assert_eq!(wave, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut dxil).expect("DXIL validation failed");
+    }
+    lowered(&native, &p, &HashSet::new()).expect("lower")
+}
+
+/// Thread 0 of a group keeps a counter in LDS between two barriers, read
+/// and written in its own branch (`if (thread == 0) lds[0] += s0`), as the title's
+/// `vfx_triangleClip:CS_CollectTriangles_Meshlets` does (0x36d0-0x393c); then every thread
+/// reads it and stores it to dword 0 of the raw UAV. One thread at most runs that branch, so
+/// the two host waves of the console wave need no meeting inside it ([`lower::one_thread_blocks`]):
+/// waves of 32, and the counter is `s0`.
+#[test]
+fn a_counter_read_and_written_by_thread_0_alone_needs_no_meeting_inside_its_branch() {
+    let shader = one_console_wave(&[
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0008, // s_cbranch_execz past the branch
+        0xD834_0000,
+        0x0000_0101, // ds_write_b32 v1, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0200_0001, // ds_read_b32 v2, v1
+        0x4A04_0400, // v_add_nc_u32 v2, s0, v2
+        0xD834_0000,
+        0x0000_0201, // ds_write_b32 v1, v2
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0300_0001, // ds_read_b32 v3, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 3 << 8, // buffer_store_dword v3, off, s[8:11], 0
+    ]);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for s0 in [0u32, 1, 7, 1000] {
+        let Some(got) = on_the_card(&shader, [s0, 0]) else { return };
+        assert_eq!(got, s0, "s0 = {s0}");
+    }
+    eprintln!("ran on the hardware device: thread 0's counter in every case");
+}
+
+/// In a group of one console wave, thread 0 sets LDS dword 0 to s1 and dword 1 to 0; after a
+/// barrier the threads below s0 read dword 0 and add it to dword 1 (`ds_add_u32`) inside
+/// their branch; after another every thread reads dword 1 and stores it. The branch writes
+/// LDS by an atomic alone and reads only a dword no atomic of it writes
+/// ([`lower::lds_atomics_apart`], the title's allocation loops): no meeting is needed inside
+/// it, waves of 32, and the sum is `s0 * s1`, whichever host waves' threads take part.
+#[test]
+fn a_branch_that_adds_to_one_lds_dword_and_reads_another_needs_no_meeting_inside_it() {
+    let shader = one_console_wave(&[
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E08_0201, // v_mov_b32 v4, s1
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0004, // s_cbranch_execz past the writes
+        0xD834_0000,
+        0x0000_0401, // ds_write_b32 v1, v4
+        0xD834_0004,
+        0x0000_0101, // ds_write_b32 v1, v1 offset:4
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005, // s_cbranch_execz past the body
+        0xD8D8_0000,
+        0x0200_0001, // ds_read_b32 v2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD800_0004,
+        0x0000_0201, // ds_add_u32 v1, v2 offset:4
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0004,
+        0x0300_0001, // ds_read_b32 v3, v1 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 3 << 8, // buffer_store_dword v3, off, s[8:11], 0
+    ]);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (s0, s1) in [(64u32, 7u32), (40, 5), (33, 2), (32, 3), (1, 9), (0, 4)] {
+        let Some(got) = on_the_card(&shader, [s0, s1]) else { return };
+        assert_eq!(got, s0 * s1, "{s0} threads adding {s1}");
+    }
+    eprintln!("ran on the hardware device: the sum over every thread taking part in every case");
 }
 
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0

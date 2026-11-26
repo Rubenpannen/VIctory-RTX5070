@@ -347,6 +347,9 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// Per IR block: whether one thread of the group at most runs it ([`one_thread_blocks`]);
+    /// empty outside compute programs.
+    one_thread: Vec<bool>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -762,6 +765,17 @@ fn wave_tid(p: &Program, x: &Parts<'_>) -> Option<Value> {
         .map(|(_, v)| *v)
 }
 
+/// The reduction an LDS atomic on one dword applies, for [`wave_local`]'s reservations.
+fn lds_reservation(name: &str) -> Option<super::wave::Op> {
+    use super::wave::Op;
+    Some(match name.strip_suffix("_rtn_u32").or_else(|| name.strip_suffix("_u32"))? {
+        "ds_add" => Op::AddU,
+        "ds_min" => Op::MinU,
+        "ds_max" => Op::MaxU,
+        _ => return None,
+    })
+}
+
 /// What a register value holds, for [`wave_local`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wave {
@@ -845,6 +859,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
                 data.iter().copied().collect()
             }
+            // an LDS atomic: the amount (the address is among what it reads besides)
+            Fields::Ds { data, .. } if lds_reservation(name).is_some() => data.to_vec(),
             _ => Vec::new(),
         };
         let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
@@ -931,6 +947,15 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             }
             ("v_lshl_add_u32", [Wave::Prefix, Wave::Plain, c]) if !wild(*c) => {
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
+            }
+            // the same on a counter in shared memory (`ds_add_rtn_u32`): each host wave takes
+            // its own slots, as two console waves would
+            (_, [Wave::Total(op)]) if lds_reservation(name).is_some() => {
+                if lds_reservation(name) != Some(*op) || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                    return Err(TOTAL);
+                }
+                reserved = true;
+                Wave::Base
             }
             // the reservation: the first lane adds its wave's total to a shared counter
             (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
@@ -1097,7 +1122,14 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+/// A region that reads and writes is taken when it only raises flags ([`lds_flag_region`]) or
+/// when one thread of the group at most runs it ([`one_thread_blocks`]; `threads` is the group).
+fn lds_meetings(
+    p: &crate::ir::Program,
+    st: &Structured,
+    all: &[bool],
+    threads: [u32; 3],
+) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -1147,9 +1179,25 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
     // the region leaves behind.
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
+    // ... and when one thread of the group at most runs it ([`one_thread_blocks`]): its accesses
+    // are in the order that thread runs them, and no other thread's come between.
+    let one = one_thread_blocks(p, st, threads);
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        if blocks.iter().all(|&b| one[b]) || lds_atomics_apart(p, st, &blocks) {
+            continue;
+        }
         if !(flags_on && lds_flag_region(p, st, &blocks)) {
+            // `VICTORY_WAVE_WHY=1`: the region refused, by its LDS accesses
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                let accesses: Vec<String> = blocks
+                    .iter()
+                    .flat_map(|&b| &p.blocks[b].insts)
+                    .filter(|i| matches!(i.fields, Fields::Ds { .. }))
+                    .map(|i| format!("{:#x} {}", i.machine.offset, i.name()))
+                    .collect();
+                eprintln!("WAVE64-LDS-REGION {} blocks: {}", blocks.len(), accesses.join(", "));
+            }
             return None;
         }
     }
@@ -1166,6 +1214,152 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// Per IR block: whether one thread of the group at most runs it. In a group of one row
+/// (`threads` `[x, 1, 1]`) the thread index is VGPR 0, and a block every lane of which has
+/// passed a compare of it with a constant (`v_cmp_eq_u32 s[0:1], 0, v0`, then
+/// `s_and_saveexec_b64` of that mask: "if (thread == 0)") is run by that one thread or none.
+/// The title keeps counters that way in shared memory, read and written by thread 0 between
+/// two barriers (`vfx_triangleClip:CS_CollectTriangles_Meshlets`, 0x36d0-0x393c).
+fn one_thread_blocks(p: &Program, st: &Structured, threads: [u32; 3]) -> Vec<bool> {
+    let n = st.exits.len();
+    let mut one = vec![false; n];
+    if threads[1] != 1 || threads[2] != 1 {
+        return one;
+    }
+    let Some(index) = p.inputs.iter().find(|(r, _)| *r == Reg::V(0)).map(|&(_, v)| v) else {
+        return one;
+    };
+    let constant = |op: &Operand| matches!(*op, Operand::Const(128..=208) | Operand::Literal(_));
+    // the lane masks of "thread == constant", by their conditions
+    let mut equal: Vec<Bool> = Vec::new();
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        if !matches!(inst.name(), "v_cmp_eq_u32" | "v_cmpx_eq_u32" | "v_cmp_eq_i32" | "v_cmpx_eq_i32") {
+            continue;
+        }
+        let Fields::Valu(v) = &inst.fields else { continue };
+        if v.dpp.is_some() || v.sdwa.is_some() || v.src.len() < 2 {
+            continue;
+        }
+        let is_index = |op: &Operand| {
+            matches!(*op, Operand::Vector { reg, .. } if u16::from(reg) == 0) && inst.read(Reg::V(0)) == Some(index)
+        };
+        let (a, b) = (&v.src[0], &v.src[1]);
+        if !(is_index(a) && constant(b) || is_index(b) && constant(a)) {
+            continue;
+        }
+        // the mask written, by its low dword
+        let low = inst
+            .writes
+            .iter()
+            .filter_map(|&(r, value)| match r {
+                Reg::S(c) => Some((u32::from(c), value)),
+                _ => None,
+            })
+            .min_by_key(|&(c, _)| c);
+        if let Some((_, low)) = low
+            && let Some(&m) = st.masks.get(&low)
+        {
+            equal.push(m);
+        }
+    }
+    for (b, one) in one.iter_mut().enumerate() {
+        *one = equal.iter().any(|&m| !st.bools.meet(&[(st.reach[b], true), (m, false)]));
+    }
+    one
+}
+
+/// Whether a lane-branch region (`blocks`, see [`lds_meetings`]) writes LDS by atomics alone,
+/// at constant addresses, and reads (plain reads) only dwords none of them writes. Split in two
+/// host waves, an atomic is still one indivisible change, and a plain read sees what was
+/// written before the region (the waves meet at its edges): what the console wave would have
+/// read in step. The title's allocation loops are of this kind: one lane of each wave adds the
+/// wave's count to a counter (`ds_add_rtn_u32` at a constant address) and every lane reads a
+/// bitmap and a limit elsewhere (`vfx_triangleClip:CS_CollectTriangles_Meshlets`,
+/// 0x39a8-0x3c04).
+/// shortcut: the two halves' atomics on one dword may come in another order than the console
+/// lanes' (an allocation then hands the halves their places the other way round).
+/// shortcut: a read at a computed address is taken as apart from the atomics when its offset
+/// lies past all of them (its address would have to wrap around 32 bits to meet one).
+fn lds_atomics_apart(p: &Program, st: &Structured, blocks: &[usize]) -> bool {
+    let mut def: HashMap<Value, (usize, usize)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                def.insert(v, (b, i));
+            }
+        }
+    }
+    // a VGPR value a `v_mov_b32` of a constant wrote, unguarded or under the same guard as `at`
+    let constant = |v: Option<Value>, at: (usize, usize)| -> Option<u32> {
+        let (b, i) = *def.get(&v?)?;
+        let inst = &p.blocks[b].insts[i];
+        if inst.name() != "v_mov_b32" {
+            return None;
+        }
+        let guard = st.guards.get(b).and_then(|g| g.get(i)).copied().flatten();
+        let same = guard.is_none() || (b == at.0 && guard == st.guards[at.0][at.1]);
+        let Fields::Valu(valu) = &inst.fields else { return None };
+        if !same || valu.dpp.is_some() || valu.sdwa.is_some() {
+            return None;
+        }
+        match *valu.src.first()? {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    };
+    const ATOMICS: [&str; 12] =
+        ["add", "sub", "rsub", "inc", "dec", "min", "max", "and", "or", "xor", "wrxchg", "cmpst"];
+    // dwords the atomics write; plain reads: (constant base, or none) and their byte offsets
+    let mut written: HashSet<u32> = HashSet::new();
+    let mut reads: Vec<(Option<u32>, Vec<u32>)> = Vec::new();
+    for &b in blocks {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let name = inst.name();
+            let Fields::Ds { addr, offset0, offset1, gds, .. } = &inst.fields else {
+                continue;
+            };
+            if name.starts_with("ds_swizzle") || name.contains("permute") {
+                continue;
+            }
+            if *gds {
+                return false;
+            }
+            let base = match *addr {
+                Some(Operand::Vector { reg, .. }) => constant(inst.read(Reg::V(reg)), (b, i)),
+                _ => return false,
+            };
+            let single = u32::from(*offset0) | u32::from(*offset1) << 8;
+            if let Some(op) = name.strip_prefix("ds_").and_then(|n| n.split('_').next())
+                && ATOMICS.contains(&op)
+            {
+                // one dword at a constant address
+                if !(name.ends_with("_u32") || name.ends_with("_i32") || name.ends_with("_b32")) {
+                    return false;
+                }
+                let Some(base) = base else { return false };
+                written.insert(base.wrapping_add(single) & !3);
+                continue;
+            }
+            let offsets = match name {
+                "ds_read_b32" => vec![single],
+                "ds_read2_b32" => vec![u32::from(*offset0) * 4, u32::from(*offset1) * 4],
+                _ => return false,
+            };
+            reads.push((base, offsets));
+        }
+    }
+    let Some(&last) = written.iter().max() else {
+        return false;
+    };
+    reads.iter().all(|(base, offsets)| {
+        offsets.iter().all(|&o| match base {
+            Some(base) => !written.contains(&(base.wrapping_add(o) & !3)),
+            None => o > last + 3,
+        })
+    })
 }
 
 /// Whether a lane-branch region (`blocks`, see [`lds_meetings`]) that both reads and writes
@@ -1906,6 +2100,7 @@ impl<'a> Lower<'a> {
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
+        let mut one_thread: Vec<bool> = Vec::new();
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         let mut split_wave = false;
@@ -1913,6 +2108,7 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            one_thread = one_thread_blocks(p, x.st, cs.threads);
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1969,7 +2165,7 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, cs.threads) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -2023,7 +2219,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, &all, cs.threads).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
@@ -2192,6 +2388,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            one_thread,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -9490,7 +9687,10 @@ impl<'a> Lower<'a> {
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
-                let r = if halves && !alike {
+                // one thread of the group at most runs the block: the console's first lane is
+                // that thread, in the host wave that runs it
+                let one = self.one_thread.get(self.cur_ir).copied().unwrap_or(false);
+                let r = if halves && !alike && !one {
                     if !self.all_lanes(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
