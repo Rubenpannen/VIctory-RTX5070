@@ -37,6 +37,24 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// The translator's switches whose values the key holds as they are set
+/// ([`build`]).
+const KEYED: &[&str] = &[
+    "VICTORY_WAVE_WIDE",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_LDS_FLAGS",
+    "VICTORY_F16_NEAREST",
+    "VICTORY_HELPER_OWN",
+    "VICTORY_FIRSTLANE_OWN",
+    "VICTORY_FIRST_HALF",
+    "VICTORY_STRICT_JOINS",
+    "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_BVH_FENCES",
+    "VICTORY_BVH_BOUNDS",
+];
+
 /// What identifies a translation beside its container: the translator
 /// (the BLAKE3 of its sources, `build.rs`), the settings it runs with, and
 /// what it was told of the host. Not our executable: a rebuild of anything
@@ -62,21 +80,7 @@ fn build() -> [u8; 32] {
         // without them here a run with `VICTORY_WAVE_WIDE=0` was
         // served the translations an earlier run of the same
         // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_LDS_FLAGS",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_MESH_OUTPUT_STRICT",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_BVH_BOUNDS",
-        ] {
+        for name in KEYED {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
             if let Some(value) = std::env::var_os(name) {
@@ -352,6 +356,52 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every switch the translator's source names is in the key, held by
+    /// one of the settings the key takes, or changes no translation. A new
+    /// switch that is in none of these fails here, instead of a run being
+    /// served translations cached with another value of it.
+    #[test]
+    fn every_translator_switch_is_keyed_or_changes_nothing() {
+        // In the key through `loop_limit`, `group_sync`, `shader_opt` and
+        // `host_settings` (`rdna_float` in `host_rdna`).
+        const KEYED_OTHERWISE: &[&str] = &[
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_GROUP_SYNC",
+            "VICTORY_SHADER_OPT",
+            "VICTORY_DISPATCH_SPLIT",
+            "VICTORY_RDNA_FLOAT",
+        ];
+        // Printed, written out, counted, or read by tests and tools only.
+        const CHANGE_NOTHING: &[&str] = &[
+            "VICTORY_WAVE_WHY",
+            "VICTORY_WAVE_DUMP",
+            "VICTORY_DESC_WHY",
+            "VICTORY_SHADER_CENSUS",
+            "VICTORY_EMIT_DUMP",
+            "VICTORY_DXIL",
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_WARP",
+            "VICTORY_CONSOLE_DXC",
+            "VICTORY_PC_DXC",
+            "VICTORY_DIFF_ONLY",
+            "VICTORY_PROBE",
+            "VICTORY_REF_PS",
+            "VICTORY_REF_VS",
+            "VICTORY_SHADER_SOURCE_HASH",
+            "VICTORY_SHADER_SWITCHES",
+        ];
+        let names: Vec<&str> = victory_shader::emit::SWITCHES.split(',').filter(|n| !n.is_empty()).collect();
+        assert!(names.contains(&"VICTORY_WAVE_WIDE"), "the generated list: {names:?}");
+        let unaccounted: Vec<&str> = names
+            .into_iter()
+            .filter(|n| !KEYED.contains(n) && !KEYED_OTHERWISE.contains(n) && !CHANGE_NOTHING.contains(n))
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "switches of the translator in no list (add those that change a translation to KEYED): {unaccounted:?}"
+        );
+    }
 
     fn shader() -> HostShader {
         HostShader {

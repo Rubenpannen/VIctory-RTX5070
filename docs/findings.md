@@ -93,7 +93,7 @@ in that order of size:
    budget, so that every later draw of it is empty. The log's frame line counts them;
    `VICTORY_INDIRECT_REST=0` is the experiment.
 5. Memory, 40-46 GB private: lists' allocators 9 GB, windows 7, uploads 4
-   (`VICTORY_MEMORY_MAP=1` lists it).
+   (the log's memory map lists it in diagnostics builds; `VICTORY_MEMORY_MAP=0` turns it off).
 
 ## The other repositories, compared
 

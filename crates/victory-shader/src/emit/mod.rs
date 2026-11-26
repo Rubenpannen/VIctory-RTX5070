@@ -276,6 +276,11 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
     parsed.map_or(unset, |n| n & all)
 }
 
+/// Every `VICTORY_*` name in the translator's source, joined by commas
+/// (`build.rs`): the switches it may read. The shader cache's test checks
+/// that its key holds each one that changes a translation.
+pub const SWITCHES: &str = env!("VICTORY_SHADER_SWITCHES");
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -287,7 +292,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+    for name in SWITCHES.split(',').filter(|n| !n.is_empty()) {
         out.extend_from_slice(name.as_bytes());
         out.push(b'=');
         if let Some(value) = std::env::var_os(name) {
