@@ -846,7 +846,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        assert!(crate::picked::on(), "set VICTORY_PICKED_WRITES=1");
+        assert!(crate::picked::on(), "set VICTORY_PICKED_WRITES=2");
         let (title, start, shadow) = title(0x6666, true);
         crate::picked::shown(vec![(shadow.clone(), start as u64, (start + LEN) as u64)], true);
         let at = (37 << 16) + 512;
@@ -977,7 +977,7 @@ mod tests {
     /// it under the submissions in the air: every one of them read the last
     /// one's value, unless `VICTORY_CARD_ALL=1` gives it two sides.)
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_ALL=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_in_pc_memory() {
         each_reads_its_own(256 << 10, 256, 0x8888, std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"), true);
     }

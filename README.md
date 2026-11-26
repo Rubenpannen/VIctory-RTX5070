@@ -28,28 +28,37 @@ has to plan around:
 | CPU | i9-12900K, 8 fast and 8 slow cores | Ryzen 9 5900X, 12 equal cores over two dies |
 | Driver | AMD | NVIDIA: its own pipeline creation times and shader cache |
 
-## Where the parent fork stood (2026-11-25, RX 7900 XTX)
+## Where the parent fork stood (2026-11-26, RX 7900 XTX)
 
-i9-12900K, 64 GB RAM, Radeon RX 7900 XTX, 1440p, the Series X profile.
+i9-12900K, 64 GB RAM, Radeon RX 7900 XTX, the Series X profile, ray tracing off.
 
 | | |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory |
+| City street, renderer patches 1+2 on | about 53 ms a frame (about 19 fps) |
+| Same scene before the patches | 57-75 ms (13-17 fps) |
+| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
+| Memory | about 35 GB of private memory: **64 GB of RAM recommended** for now |
+
+It started at 280 ms a frame in the same scenes three days earlier.
+
+### Its renderer patches (off by default while they are tested)
+
+| Switch | What it does |
+|---|---|
+| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
+| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores report the slots they write, instead of a scan of ~600,000 slots a frame |
+| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes |
+| `VICTORY_OUTPUT=<w>x<h>`, `VICTORY_RENDER_SCALE` | The title's output size (it renders for 4K otherwise) and its upscaler's render scale |
+| `VICTORY_FRAME_INTERVAL_MS` | The frame rate past the title's 30 fps, game clock unchanged |
 
 What was known to be wrong there:
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
+- Trees, signs and far objects flicker in the distance in some places.
+- Lighting is too bright or too dark after walking indoors, until the title has
+  run for a while; rooms with little direct light are too dark without `-RayTracing`.
 - Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
+- The first run of a new build stutters while the driver makes pipelines
+  (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
 ## How to run it
@@ -74,6 +83,13 @@ something is wrong. `-RayTracing` turns the title's ray-traced indirect light on
 (the default, this PC's main screen), `console` (3840x2160) or `WxH`.
 `-Log` also writes the whole log to `<data_dir>\logs\play-<date>-<time>.log`
 (`-LogFile <path>` elsewhere, outside this folder: it holds the title's data).
+
+On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
+high-performance adapter with Shader Model 6.6. The runtime logs its adapter
+name, PCI vendor and device IDs, and dedicated VRAM. Set
+`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
+name to select it explicitly. With the launcher, pass
+`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

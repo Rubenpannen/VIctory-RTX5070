@@ -83,11 +83,13 @@ See `docs/architecture.md` for the diagram. The data flow:
   descriptors back to root parameters, `emit/` writes DXIL (including emulated ray/box and
   ray/triangle tests; see `docs/fork-ray-tracing.md`). Shaders are translated when the title creates
   a pipeline, from the bytes it passes; ahead-of-time translation is only a warm-up. The shader cache
-  is keyed on the translator's source plus the switches that change a translation (the list is in
-  `victory-gpu/src/shader_cache.rs`; add new ones there). Translation depends on the host's largest
+  is keyed on `victory_shader::TRANSLATOR_VERSION` (**bump it with any change that changes a
+  translation**: cached ones are otherwise served as they are; `victory shaders` reports those that
+  came out different) plus the switches that change a translation (`KEYED` in
+  `victory-gpu/src/shader_cache.rs`; add new ones there, a test checks). Translation depends on the host's largest
   wave size (`emit::lower::host_max_wave`, from the device at run time; `VICTORY_HOST_WAVE=32` for
   offline `translate --warm`). NVIDIA has 32-lane waves only, so the console's wave64 programs take
-  the 32-lane forms (`VICTORY_WAVE_WIDE` and the other `VICTORY_WAVE_*` switches pick them).
+  the 32-lane forms (`VICTORY_WAVE_WIDE` and the other wave switches pick them).
 - **`victory-formats`** (texture tiling/detiling, BCPack, XMA/Opus), **`victory-pipeline`**
   (converter trait, content-addressed cache) and **`victory-game`** (the one title-specific crate:
   formats, build identities, hooks) handle data. Everything except `victory-game` is platform-level.
