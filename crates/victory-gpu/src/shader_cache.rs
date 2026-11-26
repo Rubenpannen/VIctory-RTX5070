@@ -88,6 +88,10 @@ const KEYED: &[&str] = &[
     "VICTORY_MESH_OUTPUT_STRICT",
     "VICTORY_BVH_FENCES",
     "VICTORY_BVH_BOUNDS",
+    "VICTORY_EARLY_DEPTH",
+    "VICTORY_D16_BITS",
+    "VICTORY_NAN_GUARD",
+    "VICTORY_SPILL_STRICT",
 ];
 
 /// Since the start: entries of an earlier build of the translator met,
