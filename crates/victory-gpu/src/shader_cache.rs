@@ -137,12 +137,6 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-        // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
-        // bytes. Only when on, so the translations cached without it keep
-        // their key.
-        if victory_shader::emit::constants_raw() {
-            bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
-        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -469,8 +463,8 @@ mod tests {
     /// served translations cached with another value of it.
     #[test]
     fn every_translator_switch_is_keyed_or_changes_nothing() {
-        // In the key through `loop_limit`, `group_sync`, `shader_opt`,
-        // `constants_raw` and `host_settings` (`rdna_float` in `host_rdna`;
+        // In the key through `loop_limit`, `group_sync`, `shader_opt`
+        // and `host_settings` (`rdna_float` in `host_rdna`;
         // the adapter picked by `VICTORY_D3D12_ADAPTER` by what it tells).
         const KEYED_OTHERWISE: &[&str] = &[
             "VICTORY_SHADER_LOOP_LIMIT",
@@ -478,7 +472,6 @@ mod tests {
             "VICTORY_SHADER_OPT",
             "VICTORY_DISPATCH_SPLIT",
             "VICTORY_RDNA_FLOAT",
-            "VICTORY_PORT_CBV",
             "VICTORY_D3D12_ADAPTER",
         ];
         // Printed, written out, counted, or read by tests and tools only.

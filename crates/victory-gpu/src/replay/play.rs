@@ -811,7 +811,7 @@ impl Player {
             let mut desc = gpu::to_desc(&r.desc);
             // Heaps are made without sharing across adapters (DROP), so a
             // resource cannot ask for it: buffers placed in a heap the host
-            // opened from title memory (renderer port 1) have the flag, and
+            // opened from title memory (`crate::inplace`) have the flag, and
             // were refused ("parameter incorrect"), and the frame's work on
             // them read nothing, or hung the card.
             desc.Flags &= !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;

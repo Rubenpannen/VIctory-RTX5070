@@ -63,9 +63,7 @@ impl Shard {
     /// (a bit each). The asking that found it written before (0: none).
     ///
     /// A page's notes only go up: with the journal held alone `now` is the
-    /// newest number there is, as it always was; noted under the shared lock
-    /// (renderer port #7) another asking with a higher number may have
-    /// noted it first.
+    /// newest number there is.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
@@ -118,12 +116,13 @@ fn shards_of(first: usize, last: usize) -> u64 {
 }
 
 /// The parts that hold `pages`, a bit each.
+#[cfg(test)]
 fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
     pages.into_iter().fold(0, |m, page| m | 1 << shard_of(page))
 }
 
-/// The pages' notes, in parts of their own, each under a lock of its own
-/// (renderer port #7). Only reached through [`JOURNAL`]: held alone, its
+/// The pages' notes, in parts of their own, each under a lock of its own.
+/// Only reached through [`JOURNAL`]: held alone, its
 /// holder changes them with no part's lock; held shared, a reader reads a
 /// part at a time, and who notes or needs a number that counts holds the
 /// parts it touches ([`Notes::hold`]).
@@ -154,10 +153,7 @@ impl Notes {
         if let Ok(s) = self.0[shard].try_read() {
             return s;
         }
-        let began = std::time::Instant::now();
-        let s = self.0[shard].read().unwrap_or_else(|e| e.into_inner());
-        port7_waited(P7_PART_WAITS, began);
-        s
+        self.0[shard].read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// See [`Shard::note`]; the journal held alone.
@@ -210,16 +206,7 @@ impl Notes {
             m &= m - 1;
             let lock = &self.0[shard];
             if write {
-                let guard = match lock.try_write() {
-                    Ok(g) => g,
-                    Err(_) => {
-                        let began = std::time::Instant::now();
-                        let g = lock.write().unwrap_or_else(|e| e.into_inner());
-                        port7_waited(P7_PART_WAITS, began);
-                        g
-                    }
-                };
-                held.write.push(guard);
+                held.write.push(lock.write().unwrap_or_else(|e| e.into_inner()));
             } else {
                 held.read.push(self.read(shard));
             }
@@ -263,6 +250,7 @@ impl Held<'_> {
     }
 
     /// See [`Shard::note`]; held for writing.
+    #[cfg(test)]
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let at = self.place(page);
         self.write[at].note(page, parts, now)
@@ -401,149 +389,14 @@ fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
         return j;
     }
-    let began = std::time::Instant::now();
-    let j = waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()));
-    port7_waited(P7_READ_WAITS, began);
-    j
+    waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
-    port7_count(P7_ALONE, 1);
     if let Ok(j) = JOURNAL.try_write() {
         return j;
     }
-    let began = std::time::Instant::now();
-    let j = waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()));
-    port7_waited(P7_ALONE_WAITS, began);
-    j
-}
-
-/// Renderer port #7 (`VICTORY_PORT_JOURNAL=1`, off by default; read here,
-/// and A/B-able in one run with `VICTORY_AB=<s>,VICTORY_PORT_JOURNAL`): the
-/// journal's lock no longer makes the threads that read it wait for those
-/// that note in it, nor those for each other, unless the standing asking
-/// changes. (The switch also covers `crate::port_journal`'s heaps' records.)
-///
-/// What it was (runs guard-4, merge-4; ports 1, 2, 5, 6 on): every note in
-/// the journal ([`JOURNAL`]) took it alone: the answers of askings found
-/// written (`writes`, a submission's one asking, what shaders put in beside a
-/// guard), and also what has nothing to change: each title buffer copy told
-/// ([`wrote`]) with no asking standing, every flush's [`ask_ahead_done`] and
-/// [`ask_once_end`]. 200 such takings a frame waited, 3-3.6 ms; the readers
-/// (a refresh's every look, ~10,000 a frame on seven threads) waited 480
-/// times, 5.4-5.9 ms; ~2.8 ms of it was the submitting thread's.
-///
-/// What it is with the switch: the pages' notes are in [`SHARDS`] parts of
-/// their own ([`Notes`]), each with a lock of its own. What changes the
-/// standing asking (its ranges, its number, whether it stands) still takes
-/// the journal alone, and so does what our steps write while it stands
-/// ([`wrote`], which moves its number). Noting an answer takes the journal
-/// shared and the parts of its pages for writing ([`Notes::hold`]): an
-/// asking about a range (`writes`), what shaders put in beside a guard
-/// ([`landed_beside`]), and the pages a submission's asking found (noted
-/// before its ranges and number are set, alone and briefly). What has
-/// nothing to change looks first under the shared lock.
-///
-/// Why nothing is lost: an answer `(number, pages)` must hold every note of
-/// a lower number of those pages. A number is taken only holding the parts
-/// of the pages it notes or answers for (who takes a fresh number to answer
-/// with holds the parts of its range for reading, switch or not), so a note
-/// of a lower number is in, or its number is higher. The standing asking's
-/// number is set with the journal held alone, after every shared holder that
-/// took a lower one let go. A page's note only goes up ([`Shard::note`]).
-/// Parts are taken in order, the journal's lock before them and never while
-/// holding them, and no holder of a part waits for anything else: no two
-/// wait for each other. Tests: `port7_tests`.
-///
-/// Measured (Series S, ports 1, 2, 5, 6 on; reports/PORT-PATCH-7.md): the
-/// journal's waits 8-9 ms a frame of all threads -> ~0.8 ms (for parts), the
-/// lane's 1.0 -> 0.0 ms; with the heaps' records (`crate::port_journal`)
-/// the lane works 42.9 -> 40.4 ms and the frame is 1.3-2.9 ms faster in the
-/// same run (A/B p7-1, p7-2), 46.1 -> 45.1-45.2 ms across runs.
-pub(crate) fn port_journal() -> bool {
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_PORT_JOURNAL") {
-        return on;
-    }
-    #[cfg(test)]
-    if PORT_JOURNAL_IN_TEST.get() {
-        return true;
-    }
-    // Read here: the switch of renderer port #7.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// [`port_journal`], for what this thread does.
-    pub(crate) static PORT_JOURNAL_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-thread_local! {
-    /// Whether this thread is the submitting lane ("victory-submit").
-    static ON_LANE: bool = std::thread::current().name() == Some("victory-submit");
-}
-
-/// Renderer port #7's counts since the last line: takings of the journal
-/// alone; of them, those that waited and nanoseconds; waits for it shared
-/// and nanoseconds; the lane's waits for it (both kinds) and nanoseconds;
-/// takings alone found needless and left out; notings done shared; waits for
-/// a part and nanoseconds.
-static PORT7: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
-const P7_ALONE: usize = 0;
-/// (A count and its nanoseconds next to it, as the others below.)
-const P7_ALONE_WAITS: usize = 1;
-const P7_READ_WAITS: usize = 3;
-const P7_LANE_WAITS: usize = 5;
-const P7_SKIPPED: usize = 7;
-const P7_SHARED_NOTES: usize = 8;
-const P7_PART_WAITS: usize = 9;
-
-fn port7_count(what: usize, n: u64) {
-    PORT7[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// A wait of kind `what` (a count, its nanoseconds next) that began then.
-fn port7_waited(what: usize, began: std::time::Instant) {
-    let ns = began.elapsed().as_nanos() as u64;
-    port7_count(what, 1);
-    port7_count(what + 1, ns);
-    if what != P7_PART_WAITS && ON_LANE.with(|l| *l) {
-        port7_count(P7_LANE_WAITS, 1);
-        port7_count(P7_LANE_WAITS + 1, ns);
-    }
-}
-
-/// Renderer port #7's journal counts, taken ([`crate::port_journal::line`]).
-pub(crate) struct Port7Counts([u64; 12]);
-
-pub(crate) fn port_journal_counts() -> Port7Counts {
-    Port7Counts(std::array::from_fn(|i| PORT7[i].swap(0, std::sync::atomic::Ordering::Relaxed)))
-}
-
-impl Port7Counts {
-    /// For the line, per frame.
-    pub(crate) fn per_frame(&self, frames: f64) -> String {
-        let n = |i: usize| self.0[i] as f64 / frames;
-        let ms = |i: usize| self.0[i] as f64 / 1e6 / frames;
-        format!(
-            "the lane waited for its lock {:.1} times, {:.2} ms; all threads waited to take it alone {:.1} times ({:.2} ms) of {:.1} \
-             takings alone, shared {:.1} times ({:.2} ms); {:.1} takings alone found needless, {:.1} notings done shared, {:.1} waits \
-             for a part ({:.2} ms)",
-            n(P7_LANE_WAITS),
-            ms(P7_LANE_WAITS + 1),
-            n(P7_ALONE_WAITS),
-            ms(P7_ALONE_WAITS + 1),
-            n(P7_ALONE),
-            n(P7_READ_WAITS),
-            ms(P7_READ_WAITS + 1),
-            n(P7_SKIPPED),
-            n(P7_SHARED_NOTES),
-            n(P7_PART_WAITS),
-            ms(P7_PART_WAITS + 1),
-        )
-    }
+    waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Since the last line: waits and nanoseconds of waiting, of all threads, for
@@ -773,7 +626,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -807,16 +660,6 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         written.extend(w);
     }
     note_hot(&written);
-    if port_journal() {
-        // Renderer port #7: the pages noted shared, under their parts; then
-        // the number and the ranges, alone (no shared holder with a lower
-        // number is left by then).
-        let now = note_shared(&written);
-        let mut j = journal_mut();
-        j.ahead_asked = now;
-        j.ahead.set(asked);
-        return;
-    }
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead.set(asked);
@@ -824,37 +667,6 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
-}
-
-/// Renderer port #7: notes `written` (pages and their parts) as found by an
-/// asking with a number taken now, holding the journal shared and their
-/// parts for writing; the number.
-fn note_shared(written: &[(usize, u16)]) -> u64 {
-    let j = journal();
-    let mut held = j.notes.hold(shards_of_pages(written.iter().map(|w| w.0)), true);
-    let now = next_asking();
-    for &(page, parts) in written {
-        held.note(page, parts, now);
-    }
-    port7_count(P7_SHARED_NOTES, 1);
-    now
-}
-
-/// Whether the kernel would refuse to ask about `[start, end)` for its view
-/// memory (renderer port #6): read-only by our hand, or known a view
-/// ([`VIEWS`]). Such a range is left to [`writes`], which goes to the guards
-/// at once; asked with others it failed their asking too, which was then
-/// asked again by halves.
-fn refused_as_view(start: usize, end: usize) -> bool {
-    if !port_guard() || !light() {
-        return false;
-    }
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let refused = PROTECTED.any(first, last) || VIEWS.any(first, last);
-    if refused {
-        port6_count(P6_NOT_ASKED, 1);
-    }
-    refused
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -995,14 +807,6 @@ fn ask_early(every: std::time::Duration) {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    // Renderer port #7: nothing to change is seen shared.
-    if port_journal() {
-        let j = journal();
-        if j.kept || j.ahead.ranges.is_empty() {
-            port7_count(P7_SKIPPED, 1);
-            return;
-        }
-    }
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
@@ -1071,7 +875,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     let mut held_ahead = Ahead::new();
     held_ahead.set(std::mem::take(&mut ahead));
     for &(start, end) in ranges {
-        if start >= end || published(start, end) || refused_as_view(start, end) {
+        if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -1100,15 +904,6 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // the two parts another thread may have asked about a range of the
     // second, copied it, and the title written it since. Under the first
     // part's number that write was older than the copy, and never copied.
-    if port_journal() {
-        // Renderer port #7: noted shared first (see `ask_ahead_held`).
-        let now = note_shared(&written);
-        let mut j = journal_mut();
-        j.ahead_asked = now;
-        j.kept = !ahead.is_empty();
-        j.ahead.set(ahead);
-        return;
-    }
     let mut j = journal_mut();
     let now = next_asking();
     j.ahead_asked = now;
@@ -1163,11 +958,6 @@ pub(crate) fn alone_line(frames: f64) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    // Renderer port #7: none standing is seen shared.
-    if port_journal() && !journal().kept {
-        port7_count(P7_SKIPPED, 1);
-        return;
-    }
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
@@ -1179,12 +969,6 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    // Renderer port #7: with no asking standing there is nothing to note,
-    // which is seen shared. (Standing, its number moves: alone, as before.)
-    if port_journal() && (len == 0 || !journal().kept) {
-        port7_count(P7_SKIPPED, 1);
-        return;
-    }
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
@@ -1255,9 +1039,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
     let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)));
-    // A fresh number and the notes of the range, its parts held meanwhile
-    // (renderer port #7, switch or not: who notes shared takes its number
-    // holding the parts it notes in).
+    // A fresh number and the notes of the range, its parts held meanwhile.
     let fresh = || {
         let j = journal();
         let held = j.notes.hold(shards_of(first, last), false);
@@ -1275,12 +1057,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         return Some(fresh());
     }
-    // Renderer port #6: view memory, which the kernel would refuse, and the
-    // caller does not ask the guards (textures, which then guard by a way of
-    // their own): no kernel call, ~300 a frame (run guard-2).
-    if !guarded && refused_as_view(start, end) {
-        return None;
-    }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
@@ -1288,14 +1064,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return Some(known);
     }
     let mut guards_asked = false;
-    // (View memory read-only by our hand: the kernel would refuse. With
-    // renderer port #6 also view memory known as such, [`VIEWS`].)
-    let protected = guarded && light() && PROTECTED.any(first, last);
-    let viewed = guarded && !protected && known_views(first, last);
-    if viewed {
-        port6_count(P6_NOT_ASKED, 1);
-    }
-    let refused = protected || viewed;
+    // (View memory read-only by our hand: the kernel would refuse.)
+    let refused = guarded && light() && PROTECTED.any(first, last);
     let pages = match if refused { None } else { kernel_written(first, last) } {
         Some(pages) => pages,
         None => {
@@ -1305,16 +1075,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let mut written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
-            if written.is_none() && viewed {
-                // Not a view after all (other memory there now): forgotten as
-                // one, and the kernel asked as before.
-                (first..last).for_each(|block| VIEWS.clear(block));
-                if let Some(pages) = kernel_written(first, last) {
-                    guards_asked = false;
-                    written = Some(pages);
-                }
-            }
+            let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1333,18 +1094,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         // Nothing to note: the others may go on reading.
         return Some(fresh());
     }
-    let answer = if port_journal() {
-        // Renderer port #7: shared, the range's parts held for writing (the
-        // range is held too: no other asking notes any of it meanwhile).
-        let j = journal();
-        let mut held = j.notes.hold(shards_of(first, last) | shards_of_pages(pages.iter().map(|p| p.0)), true);
-        let now = next_asking();
-        for &(page, parts) in &pages {
-            held.note(page, parts, now);
-        }
-        port7_count(P7_SHARED_NOTES, 1);
-        (now, held.range(first, last))
-    } else {
+    let answer = {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
@@ -1456,200 +1206,6 @@ pub(crate) fn light() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIGHT_REFRESH").is_none_or(|v| v != "0"))
 }
 
-/// Renderer port #6 (`VICTORY_PORT_GUARD=1`, off by default; read here, and
-/// A/B-able in one run with `VICTORY_AB=<s>,VICTORY_PORT_GUARD`): the guards'
-/// one lock no longer makes the title's write faults, and the refreshes'
-/// looks at view memory, wait for one another.
-///
-/// What it was (run best-1, Series S, ports 1, 2 and 5 on): some 350 write
-/// faults a frame, each taking [`GUARDS`] alone to give one block its write
-/// access back, and some 220 refreshes a frame guarding view memory block by
-/// block under the same lock (every `VirtualProtect` of theirs under it):
-/// 450 waits for the lock, 58-62 ms a frame of all threads' time, 20 of it the
-/// refreshes' (2.5-4.5 ms of the submitting thread's), the rest the title's
-/// threads, mostly queued behind one another.
-///
-/// What it is with the switch: [`GUARDS`] is a lock for readers and one
-/// writer. The sets of blocks in it are of atomic words, so what changes a
-/// block's state needs no lock of all of them: a block's own claim does
-/// ([`BUSY`]). A fault, a refresh guarding its range and a block made known
-/// by its bits ([`publish`]) take the lock shared and the claims of the
-/// blocks they change, so they wait only for those who change the same
-/// block (a `VirtualProtect` of it) and for the few things that still take
-/// the lock alone (a mapping changed, a kernel read, memory freed, the holes
-/// looked at, ...), which take no claims: holding the lock alone, nobody
-/// holds one. Who waits for a claim holds no other claim, or only claims of
-/// lower blocks (faults take theirs in order); who holds claims and wants
-/// more only tries for them (a refresh: what it cannot claim it leaves as it
-/// is, written, told so at the next asking), so no two wait for each other.
-///
-/// Also with the switch:
-/// - view memory is not asked of the kernel, which refuses it
-///   ([`VIEWS`]; ~300 refused askings a frame);
-/// - the planning of a submission's refreshes is made beside the submitting
-///   thread ([`port_guard_plan`]);
-/// - only if asked for (`VICTORY_GUARD_HOT=<ms>`, [`hot_rest`]): a block the
-///   title writes again soon after each time it was taken rests longer.
-///   Measured worse (run guard-6: 45.6 -> 47.8 ms a frame): off.
-pub(crate) fn port_guard() -> bool {
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_PORT_GUARD") {
-        return on;
-    }
-    #[cfg(test)]
-    if PORT_GUARD_IN_TEST.get() {
-        return true;
-    }
-    // Read here: the switch of renderer port #6.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_GUARD").is_ok_and(|v| v.trim() == "1"))
-}
-
-/// With renderer port #6: whether a submission's look at which refreshes
-/// copy nothing (`Shadow::nothing_new`, before the threads are woken for the
-/// others) is made on the threads beside the submitting one, as it already
-/// was for more than 256 refreshes (`VICTORY_PORT_GUARD_PLAN=0`: on the
-/// submitting thread, as before; A/B-able by that name).
-///
-/// A look walks the journal's every page ever written in the range; one
-/// submission a frame spent up to 6 ms in it alone, the six threads beside it
-/// idle (runs lane-1, guard-3).
-pub(crate) fn port_guard_plan() -> bool {
-    if !port_guard() {
-        return false;
-    }
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_PORT_GUARD_PLAN") {
-        return on;
-    }
-    // Read here: renderer port #6's planning beside the submitting thread.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD_PLAN").is_none_or(|v| v != "0"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// [`hot_rest`] in milliseconds, for what this thread does (0: as set).
-    pub(crate) static HOT_IN_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// [`port_guard`], for what this thread does.
-    pub(crate) static PORT_GUARD_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The blocks a thread holding [`GUARDS`] shared is changing the state of
-/// (renderer port #6, [`port_guard`]): a bit each, set by who changes it
-/// ([`Claims`]).
-static BUSY: Bits = Bits::new();
-
-/// Claims of blocks ([`BUSY`]), let go when dropped.
-struct Claims(Vec<usize>);
-
-impl Claims {
-    /// The claims of `blocks` (in order, each once), waited for one after
-    /// the other: who waits holds only claims of lower blocks.
-    fn wait_for(blocks: &[usize]) -> Claims {
-        debug_assert!(blocks.windows(2).all(|w| w[0] < w[1]));
-        let mut spun = 0u64;
-        for &block in blocks {
-            let mut tries = 0u32;
-            while !BUSY.try_set(block) {
-                tries += 1;
-                spun += 1;
-                if tries < 64 {
-                    std::hint::spin_loop();
-                } else {
-                    // Another thread's `VirtualProtect` of the block.
-                    std::thread::yield_now();
-                }
-            }
-        }
-        if spun != 0 {
-            port6_count(P6_CLAIM_SPINS, spun);
-        }
-        Claims(blocks.to_vec())
-    }
-
-    /// The claim of `block` if it is free; nothing waited for.
-    fn try_one(&mut self, block: usize) -> bool {
-        let got = BUSY.try_set(block);
-        if got {
-            self.0.push(block);
-        } else {
-            port6_count(P6_CLAIMS_MISSED, 1);
-        }
-        got
-    }
-
-    fn none() -> Claims {
-        Claims(Vec::new())
-    }
-
-    fn holds(&self, block: usize) -> bool {
-        self.0.contains(&block)
-    }
-}
-
-impl Drop for Claims {
-    fn drop(&mut self) {
-        for &block in &self.0 {
-            BUSY.clear(block);
-        }
-    }
-}
-
-/// Renderer port #6's counts since the last line: faults opened under the
-/// shared lock; nanoseconds they waited for the lock; refreshes' guards
-/// done shared; blocks a refresh could not claim (left written); spins for
-/// claims; blocks rested longer for being hot; kernel askings left out for
-/// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
-const P6_FAULTS: usize = 0;
-const P6_FAULT_WAIT_NS: usize = 1;
-const P6_GUARDS: usize = 2;
-const P6_CLAIMS_MISSED: usize = 3;
-const P6_CLAIM_SPINS: usize = 4;
-const P6_RESTED_HOT: usize = 5;
-const P6_NOT_ASKED: usize = 6;
-const P6_HOT: usize = 7;
-
-fn port6_count(what: usize, n: u64) {
-    PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Renderer port #6's line of the frame lines, per frame.
-pub(crate) fn port_guard_line(frames: f64) {
-    let n: Vec<f64> = PORT6.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
-    if !port_guard() && n.iter().all(|&v| v == 0.0) {
-        return;
-    }
-    tracing::info!(
-        "renderer port 6 (VICTORY_PORT_GUARD=1) per frame: faults opened under the shared lock {:.1} ({:.2} ms waiting for it), \
-         refreshes' guards done shared {:.1}, blocks left written for want of their claim {:.1}, spins for claims {:.0}; \
-         blocks found hot {:.1}, rests longer for it {:.1} (VICTORY_GUARD_HOT); kernel askings left out for view memory {:.1}",
-        n[P6_FAULTS],
-        n[P6_FAULT_WAIT_NS] / 1e6,
-        n[P6_GUARDS],
-        n[P6_CLAIMS_MISSED],
-        n[P6_CLAIM_SPINS],
-        n[P6_HOT],
-        n[P6_RESTED_HOT],
-        n[P6_NOT_ASKED],
-    );
-}
-
-/// The blocks known to be view memory (renderer port #6): guarded by us
-/// once, or found a view by [`guard`]. The kernel refuses to ask about them
-/// (its write watch is not kept for views), and with the switch such a
-/// range goes to the guards at once. Forgotten when the memory is unmapped
-/// or freed; a block wrongly here is only looked at by the guards, which
-/// find it no view ([`is_view`]) and say the range is not watched.
-static VIEWS: Bits = Bits::new();
-
-/// Whether a block of `[first, last)` is known view memory and the kernel
-/// need not be asked ([`VIEWS`]).
-fn known_views(first: usize, last: usize) -> bool {
-    port_guard() && light() && VIEWS.any(first, last)
-}
-
 /// A bit per block of the address space, in pieces made when first needed
 /// and never let go.
 struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
@@ -1689,11 +1245,6 @@ impl Bits {
         if let Some(piece) = self.piece(word) {
             piece[word % Bits::WORDS].fetch_or(1 << (block % 64), SeqCst);
         }
-    }
-
-    /// Sets it if it was not set: whether it was not.
-    fn try_set(&self, block: usize) -> bool {
-        self.set_was(block) == Some(false)
     }
 
     /// Sets it; whether it was set before (`None`: out of the address space).
@@ -1937,74 +1488,20 @@ pub(crate) fn opened_for_writing(at: usize) {
 /// there (or is about to be made), and notes it opened: how many blocks were
 /// opened (0: it was not guarded, or another thread opened it first), and how
 /// long the guards' lock was waited for.
-///
-/// With renderer port #6 the lock is taken shared and the claims of the block
-/// and of its page's other views are waited for, in order: the block's state
-/// is changed by nobody else meanwhile, and other faults go on beside this.
 fn open_faulted(at: usize) -> (usize, std::time::Duration) {
     let block = at / BLOCK;
     let began = std::time::Instant::now();
-    if !port_guard() {
-        let g = guards();
-        let waited = began.elapsed();
-        let opened = open(&g, at, at + 1);
-        if opened != 0 {
-            g.opened(block);
-        }
-        return (opened, waited);
-    }
-    let g = guards_shared();
+    let g = guards();
     let waited = began.elapsed();
-    port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
-    let mut views: Vec<usize> = vec![block];
-    loop {
-        let _claims = Claims::wait_for(&views);
-        if !g.protected.contains(block) {
-            return (0, waited);
-        }
-        let given = if g.aliased.contains(block) {
-            // (The views as the table has them now, as `open` looks them up;
-            // a view mapped after this opens what is guarded of the page
-            // again, holding the lock alone: `views_mapped`.)
-            let mut now: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|p| p / BLOCK).collect();
-            now.push(block);
-            now.sort_unstable();
-            now.dedup();
-            if now.iter().any(|b| views.binary_search(b).is_err()) {
-                // Their claims too, in order: again.
-                views = now;
-                continue;
-            }
-            Some(now)
-        } else {
-            None
-        };
-        let opened = open_given(&g, at, at + 1, given.as_deref());
-        if opened != 0 {
-            g.opened(block);
-            port6_count(P6_FAULTS, 1);
-        }
-        return (opened, waited);
+    let opened = open(&g, at, at + 1);
+    if opened != 0 {
+        g.opened(block);
     }
+    (opened, waited)
 }
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
-    if port_guard() {
-        // A block's claim while its bit is set: a fault opening it meanwhile
-        // clears the bit after this sets it, never before.
-        let g = guards_shared();
-        for &page in pages {
-            let _claim = Claims::wait_for(&[page]);
-            if g.clean.contains(page) || g.held.contains(page) {
-                PUBLISHED.set(page);
-                if BESIDE.any(page, page + 1) {
-                    PUBLISHED.clear(page);
-                }
-            }
-        }
-        return;
-    }
     let g = guards();
     for &page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
@@ -2176,22 +1673,9 @@ fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
     g
 }
 
-/// [`guards_shared`], the wait for it counted.
-fn guards_timed_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    let g = guards_shared();
-    #[cfg(feature = "diagnostics")]
-    tally(7, started.elapsed().as_nanos() as u64);
-    g
-}
-
 /// A set of blocks, a bit each: a fault, or a look at a range of thousands of
 /// blocks, is a few words of it and no walk through a tree of every guarded
-/// block there is. Of atomic words (renderer port #6): a thread holding
-/// [`GUARDS`] shared changes the bits of the blocks it holds the claims of
-/// ([`BUSY`]), while others read and change other blocks' bits of the same
-/// words. Who holds the lock alone sees and changes them as before.
+/// block there is.
 struct Blocks(Bits);
 
 impl Blocks {
@@ -2340,60 +1824,9 @@ struct Guards {
     /// one opens them all. (A write's range can be huge, `fread`'s, so only
     /// these are looked up.)
     aliased: Blocks,
-    /// Blocks opened by a write fault, and when ([`rest`]); and how hot each
-    /// is ([`hot_rest`]). Behind a lock of its own: faults note in it holding
-    /// [`GUARDS`] shared.
-    opened: Mutex<std::collections::HashMap<usize, Opened, std::hash::BuildHasherDefault<PageHash>>>,
-}
-
-/// When a write fault opened a block, and how often it had been written again
-/// soon after it was taken ([`hot_rest`]).
-#[derive(Clone, Copy)]
-struct Opened {
-    at: std::time::Instant,
-    hot: u8,
-}
-
-/// How long a block the title writes again soon after each time it is taken
-/// rests at most (renderer port #6, `VICTORY_GUARD_HOT=<ms>`; unset or 0:
-/// off, [`rest`] for all). A block opened by a fault within its rest and
-/// 50 ms more after it last was rests twice as long the next time, up to
-/// this; one that stayed clean longer rests [`rest`] again. Such a block is
-/// told as written at every asking while it rests (as a resting block always
-/// was), so what is missed is nothing; what it costs is a look at its bytes
-/// at every refresh of a copy over it instead of a protection change and a
-/// fault each time.
-fn hot_rest() -> std::time::Duration {
-    #[cfg(test)]
-    if HOT_IN_TEST.get() != 0 {
-        return std::time::Duration::from_millis(HOT_IN_TEST.get());
-    }
-    #[cfg(feature = "diagnostics")]
-    if crate::ab::pick("VICTORY_GUARD_HOT") == Some(false) {
-        return std::time::Duration::ZERO;
-    }
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let ms = *MS.get_or_init(|| {
-        std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(1000)
-    });
-    if ms == 0 || !port_guard() {
-        return std::time::Duration::ZERO;
-    }
-    std::time::Duration::from_millis(ms)
-}
-
-impl Opened {
-    /// How long a block opened so rests.
-    fn rest(&self, rest: std::time::Duration) -> std::time::Duration {
-        if self.hot == 0 || rest.is_zero() {
-            return rest;
-        }
-        let most = hot_rest();
-        if most.is_zero() {
-            return rest;
-        }
-        rest.saturating_mul(1 << self.hot.min(16)).min(most.max(rest))
-    }
+    /// Blocks opened by a write fault, and when ([`rest`]). Behind a lock
+    /// of its own.
+    opened: Mutex<std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>>,
 }
 
 impl Guards {
@@ -2407,44 +1840,26 @@ impl Guards {
             return false;
         }
         let opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
-        opened.get(&block).is_some_and(|o| {
-            let elapsed = o.at.elapsed();
-            let longer = o.rest(rest);
-            if elapsed >= rest && elapsed < longer {
-                port6_count(P6_RESTED_HOT, 1);
-            }
-            elapsed < longer
-        })
+        opened.get(&block).is_some_and(|at| at.elapsed() < rest)
     }
 
     /// A write fault opened `block`.
     fn opened(&self, block: usize) {
         const MANY: usize = 1 << 13;
-        let rest = rest();
         let mut opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
         if opened.len() >= MANY {
-            let keep = std::time::Duration::from_millis(50).max(hot_rest() + std::time::Duration::from_millis(50));
-            opened.retain(|_, o| o.at.elapsed() < keep);
+            let keep = std::time::Duration::from_millis(50);
+            opened.retain(|_, at| at.elapsed() < keep);
             if opened.len() >= MANY {
                 opened.clear();
             }
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
-        let now = std::time::Instant::now();
-        let hot = match opened.get(&block) {
-            // Written again within its rest and a little more: hotter.
-            Some(o) if !hot_rest().is_zero() && now.duration_since(o.at) < o.rest(rest) + std::time::Duration::from_millis(50) => {
-                port6_count(P6_HOT, 1);
-                o.hot.saturating_add(1).min(16)
-            }
-            _ => 0,
-        };
-        opened.insert(block, Opened { at: now, hot });
+        opened.insert(block, std::time::Instant::now());
     }
 }
 
-/// Read by many threads at once with renderer port #6 ([`port_guard`]), held
-/// alone otherwise and by what changes more than single blocks' states.
+/// The guards' state, held alone by whoever changes it.
 static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: Blocks::new(),
     clean: Blocks::new(),
@@ -2463,15 +1878,6 @@ fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
         return g;
     }
     waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// The guards, shared (renderer port #6): what changes a block's state holds
-/// its claim ([`Claims`]).
-fn guards_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_read() {
-        return g;
-    }
-    waited(3, || GUARDS.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -2621,29 +2027,14 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
             }
         }
         let others = || elsewhere.iter().flat_map(|(_, others)| others.iter().map(|other| other / PAGE));
-        if port_journal() {
-            // Renderer port #7: shared, the parts of its pages held.
-            let j = journal();
-            let mut held = j.notes.hold(shards_of_pages(blocks.iter().map(|b| b.0).chain(others())), true);
-            let now = next_asking();
-            noted = now;
-            for (block, parts) in blocks {
-                before.push((block, held.note(block, parts, now)));
-            }
-            for other in others() {
-                held.note(other, WHOLE, now);
-            }
-            port7_count(P7_SHARED_NOTES, 1);
-        } else {
-            let mut j = journal_mut();
-            let now = next_asking();
-            noted = now;
-            for (block, parts) in blocks {
-                before.push((block, j.notes.note(block, parts, now)));
-            }
-            for other in others() {
-                j.notes.note(other, WHOLE, now);
-            }
+        let mut j = journal_mut();
+        let now = next_asking();
+        noted = now;
+        for (block, parts) in blocks {
+            before.push((block, j.notes.note(block, parts, now)));
+        }
+        for other in others() {
+            j.notes.note(other, WHOLE, now);
         }
     }
     for &(at, len) in spans {
@@ -2701,9 +2092,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (PROTECTED.any(first, first + 1) || {
-            // (Renderer port #6: shared, a look only.)
-            let of = |g: &Guards| g.protected.contains(first) || g.absent.contains(first);
-            if port_guard() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
+            let g = guards_timed();
+            g.protected.contains(first) || g.absent.contains(first)
         });
     if !known && !is_view(start, end) {
         return None;
@@ -2720,9 +2110,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
             Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())
         };
-        // (Renderer port #6: shared, a look only. A block a fault opens
-        // meanwhile was clean, read-only and unwritten when looked at.)
-        let unsure = if port_guard() { of(&guards_timed_shared()) } else { of(&guards_timed()) };
+        let unsure = of(&guards_timed());
         match unsure {
             Some(unsure) => unsure,
             None => {
@@ -2749,13 +2137,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     let rest = rest();
-    if port_guard() {
-        // (Renderer port #6: known for a view from now on.)
-        if !VIEWS.all(first, last) {
-            (first..last).for_each(|block| VIEWS.set(block));
-        }
-        return Some(guard_shared(first, last, &came, rest));
-    }
     let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
@@ -2798,7 +2179,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.clean.contains(block) {
                 continue;
             }
-            if cover(&g, block, block + 1, None) {
+            if cover(&g, block, block + 1) {
                 g.clean.insert(block);
             }
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
@@ -2814,95 +2195,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     Some(written)
-}
-
-/// The rest of [`guard`] with renderer port #6: the lock shared, and a
-/// block's claim held while its state changes. What a fault opens meanwhile
-/// is opened before or after the block's state is looked at and changed,
-/// never in between; a block whose claim another holds (a fault, a cover of
-/// another range's) is left as it is, written: told so now, and looked at
-/// again at the next asking.
-fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::time::Duration) -> Vec<usize> {
-    if !came.is_empty() {
-        // (Changes no block's protection: the sets of what is where.)
-        let mut g = guards_timed();
-        for &(block, view) in came {
-            if g.absent.remove(block) && !view {
-                g.foreign.insert(block);
-            }
-        }
-    }
-    port6_count(P6_GUARDS, 1);
-    let g = guards_timed_shared();
-    #[cfg(feature = "diagnostics")]
-    tally(4, 1);
-    let mut written = Vec::new();
-    for word in first / 64..last.div_ceil(64) {
-        let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
-        written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
-    }
-    let mut run: Option<(usize, usize)> = None;
-    for &block in &written {
-        if let Some((from, to)) = run
-            && to != block
-        {
-            protect_claimed(&g, from, to);
-            run = None;
-        }
-        // Told as written by this, and read by the caller after.
-        if BESIDE.take(block) {
-            put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-        if g.protected.contains(block) {
-            if let Some((from, to)) = run.take() {
-                protect_claimed(&g, from, to);
-            }
-            if g.clean.contains(block) {
-                continue;
-            }
-            // (No other claim is held here.)
-            let mut claims = Claims::wait_for(&[block]);
-            if g.protected.contains(block) && !g.clean.contains(block) && cover(&g, block, block + 1, Some(&mut claims)) {
-                g.clean.insert(block);
-            }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
-            run = Some((run.map_or(block, |r| r.0), block + 1));
-        } else if let Some((from, to)) = run.take() {
-            protect_claimed(&g, from, to);
-        }
-    }
-    if let Some((from, to)) = run {
-        protect_claimed(&g, from, to);
-    }
-    drop(g);
-    #[cfg(feature = "diagnostics")]
-    crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
-    written
-}
-
-/// [`protect`] of `[from, to)` with the lock shared: of the blocks whose
-/// claims can be had now, each run, its other views' blocks only where their
-/// claims can be had too.
-fn protect_claimed(g: &Guards, from: usize, to: usize) {
-    let mut claims = Claims::none();
-    let mut start = None;
-    for block in from..to {
-        if claims.try_one(block) {
-            start.get_or_insert(block);
-        } else if let Some(s) = start.take() {
-            protect_run(g, s, block, &mut claims);
-        }
-    }
-    if let Some(s) = start {
-        protect_run(g, s, to, &mut claims);
-    }
-}
-
-fn protect_run(g: &Guards, from: usize, to: usize, claims: &mut Claims) {
-    #[cfg(feature = "diagnostics")]
-    crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
-    protect_here(g, from, to);
-    cover(g, from, to, Some(claims));
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -2959,7 +2251,7 @@ fn protect(g: &Guards, from: usize, to: usize) {
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
     protect_here(g, from, to);
-    cover(g, from, to, None);
+    cover(g, from, to);
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -2983,11 +2275,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// cannot be (the kernel writes through it now, or the runtime is changing
 /// it), a write through it would not be seen: that block is not clean, and
 /// told as written at every asking, until it can. Whether all are covered.
-///
-/// With the lock shared (renderer port #6), `claims` holds the claims of
-/// `[from, to)`'s blocks, and gets those of the other views' blocks it can
-/// have now; a view whose block's claim cannot be had is not covered.
-fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) -> bool {
+fn cover(g: &Guards, from: usize, to: usize) -> bool {
     let mut all = true;
     for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
         let block = page / BLOCK;
@@ -2999,7 +2287,7 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
         g.aliased.insert(block);
         let mut covered = true;
         for other in others {
-            covered &= protect_alias(g, other / BLOCK, claims.as_deref_mut());
+            covered &= protect_alias(g, other / BLOCK);
         }
         if !covered {
             all = false;
@@ -3015,15 +2303,8 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
 /// page ([`guard`] tells such a block as written, then notes it clean).
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
-fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool {
+fn protect_alias(g: &Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    if let Some(claims) = claims
-        && !claims.holds(block)
-        && !claims.try_one(block)
-    {
-        // Another changes it now (a fault opens it): not covered.
-        return false;
-    }
     g.aliased.insert(block);
     if g.protected.contains(block) {
         return true;
@@ -3634,7 +2915,6 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
         CHANGING.set((true, true));
@@ -3658,11 +2938,6 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
-    if len != 0 {
-        forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
-        forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
-    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -3711,17 +2986,6 @@ fn allocation_end(at: usize, inside: usize) -> usize {
         next = ask(to);
     }
     end
-}
-
-/// What is known of `[first, last)` as view memory ([`VIEWS`]) is forgotten.
-fn forget_views(first: usize, last: usize) {
-    if !VIEWS.any(first, last) {
-        return;
-    }
-    let set: Vec<usize> = VIEWS.set_in(first, last).collect();
-    for block in set {
-        VIEWS.clear(block);
-    }
 }
 
 /// Tells what keeps track of what title memory shows; the guards, with no
@@ -5241,38 +4505,14 @@ mod many_askers_tests {
     /// again between.
     #[test]
     fn no_write_to_views_is_lost_between_askers() {
-        writes_to_views_are_not_lost::<1>(0, 0);
-    }
-
-    /// The same with renderer port #6 ([`super::port_guard`]): faults and
-    /// refreshes beside one another under the shared lock, each block's state
-    /// changed by the holder of its claim.
-    #[test]
-    fn no_write_to_views_is_lost_between_askers_with_port_6() {
-        writes_to_views_are_not_lost::<1>(0, 1);
-    }
-
-    /// Pages at three addresses, a view coming and going, with port #6; and
-    /// with half the threads under the shared lock and half under the lock
-    /// alone (the switch changes in an A/B run).
-    #[test]
-    fn no_write_through_another_view_is_lost_with_port_6() {
-        writes_to_views_are_not_lost::<3>(0, 1);
-        writes_to_views_are_not_lost::<3>(0, 2);
-    }
-
-    /// Resting blocks with port #6, hot ones resting longer.
-    #[test]
-    fn no_write_to_resting_views_is_lost_with_port_6() {
-        writes_to_views_are_not_lost::<3>(50, 1);
-        writes_to_views_are_not_lost::<1>(50, 2);
+        writes_to_views_are_not_lost::<1>(0);
     }
 
     /// The same with blocks that rest after a write ([`super::rest`]).
     #[test]
     fn no_write_to_resting_views_is_lost_between_askers() {
-        writes_to_views_are_not_lost::<1>(50, 0);
-        writes_to_views_are_not_lost::<3>(50, 0);
+        writes_to_views_are_not_lost::<1>(50);
+        writes_to_views_are_not_lost::<3>(50);
     }
 
     /// The same of pages shown at three addresses, each of which has copies
@@ -5282,12 +4522,10 @@ mod many_askers_tests {
     /// for one address only, `VICTORY_VIEW_GUARD=0`.)
     #[test]
     fn no_write_through_another_view_is_lost_between_askers() {
-        writes_to_views_are_not_lost::<3>(0, 0);
+        writes_to_views_are_not_lost::<3>(0);
     }
 
-    /// `port`: 0, renderer port #6 off; 1, on in all threads; 2, on in every
-    /// other thread.
-    fn writes_to_views_are_not_lost<const VIEWS: usize>(rest: u64, port: u8) {
+    fn writes_to_views_are_not_lost<const VIEWS: usize>(rest: u64) {
         let rest = std::time::Duration::from_micros(rest);
         const PAGES: usize = 12;
         const THREADS: usize = 8;
@@ -5312,15 +4550,12 @@ mod many_askers_tests {
             (section as usize, all)
         };
         let by_bits = std::sync::atomic::AtomicUsize::new(0);
-        let port6 = |what: usize| super::PORT6[what].load(std::sync::atomic::Ordering::Relaxed);
-        let port6_before = [super::P6_FAULTS, super::P6_GUARDS].map(port6);
         let past = std::sync::atomic::AtomicUsize::new(0);
         let title_beside = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
             if VIEWS > 1 {
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
-                    super::PORT_GUARD_IN_TEST.set(port == 1);
                     let mut last = [0u64; VIEWS];
                     for round in 0..300usize {
                         let (page, asked) = (round * 5 % PAGES, round % VIEWS);
@@ -5351,8 +4586,6 @@ mod many_askers_tests {
                 let (by_bits, past, title_beside) = (&by_bits, &past, &title_beside);
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
-                    super::PORT_GUARD_IN_TEST.set(port == 1 || port == 2 && t % 2 == 1);
-                    super::HOT_IN_TEST.set(if rest.is_zero() { 0 } else { 20 });
                     let mut last = [[0u64; PAGES]; VIEWS];
                     let mut seed = t as u64 * 7919 + 1;
                     let mut next = |n: usize| {
@@ -5434,10 +4667,6 @@ mod many_askers_tests {
             }
         });
         assert!(by_bits.into_inner() > 0, "the bits answered none");
-        if port != 0 {
-            let after = [super::P6_FAULTS, super::P6_GUARDS].map(port6);
-            assert!(after[0] > port6_before[0] && after[1] > port6_before[1], "port 6: no fault or guard under the shared lock");
-        }
         assert!(past.into_inner() > 0, "nothing was put past the guards");
         assert!(title_beside.into_inner() > 0, "nothing of the title's was put in beside the guards");
         // (The view stays: at its address other tests' memory would be told
@@ -5679,9 +4908,9 @@ mod many_askers_tests {
     }
 }
 
-/// Renderer port #7 ([`port_journal`]): the journal's notes in parts.
+/// The journal's notes in parts.
 #[cfg(test)]
-mod port7_tests {
+mod journal_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use windows_sys::Win32::System::Memory::*;
@@ -5823,20 +5052,13 @@ mod port7_tests {
         wait.recv_timeout(std::time::Duration::from_secs(60)).expect("the parts' holders deadlocked (or a check failed)");
     }
 
-    /// The journal's functions themselves, with the switch on in all threads
-    /// and in every other one (as in an A/B run): writers and askers of one
+    /// The journal's functions themselves: writers and askers of one
     /// region; a submission's one asking standing over another region, its
     /// thread writing there (told with `wrote` or found by its asking), and
     /// other threads asking about that region meanwhile. Whoever wrote a page
     /// before asking is told of that write.
     #[test]
-    fn no_write_is_lost_with_port_7() {
-        askers_and_a_submission(1);
-        askers_and_a_submission(2);
-    }
-
-    /// `port`: 1, renderer port #7 on in all threads; 2, in every other.
-    fn askers_and_a_submission(port: u8) {
+    fn no_write_is_lost() {
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         const PAGES: usize = 48;
         const HALF: usize = PAGES / 2;
@@ -5846,13 +5068,10 @@ mod port7_tests {
             VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert!(at != 0 && at.is_multiple_of(PAGE));
-        let shared_before = PORT7[P7_SHARED_NOTES].load(Relaxed);
-        let skipped_before = PORT7[P7_SKIPPED].load(Relaxed);
         std::thread::scope(|s| {
             // Writers and askers of the first half.
             for t in 0..THREADS {
                 s.spawn(move || {
-                    PORT_JOURNAL_IN_TEST.set(port == 1 || t % 2 == 0);
                     let mut last = [0u64; HALF];
                     let mut seed = t as u64 * 7919 + 1;
                     for _ in 0..2500 {
@@ -5879,7 +5098,6 @@ mod port7_tests {
             // the kernel's answers from the submission's thread.
             for t in 0..2 {
                 s.spawn(move || {
-                    PORT_JOURNAL_IN_TEST.set(port == 1 || t == 0);
                     let mut seed = t as u64 * 31 + 5;
                     for _ in 0..3000 {
                         let page = HALF + rng(&mut seed, HALF);
@@ -5895,7 +5113,6 @@ mod port7_tests {
                 let mut last = [0u64; HALF];
                 let mut seed = 99;
                 for round in 0..400 {
-                    PORT_JOURNAL_IN_TEST.set(port == 1 || round % 2 == 0);
                     let before: Vec<usize> = (0..3).map(|_| rng(&mut seed, HALF)).collect();
                     for &p in &before {
                         // SAFETY: committed memory of ours.
@@ -5923,8 +5140,6 @@ mod port7_tests {
                 }
             });
         });
-        assert!(PORT7[P7_SHARED_NOTES].load(Relaxed) > shared_before, "the shared notings ran");
-        assert!(PORT7[P7_SKIPPED].load(Relaxed) > skipped_before, "needless takings alone were left out");
         // SAFETY: the reservation made above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }

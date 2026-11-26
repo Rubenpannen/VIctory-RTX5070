@@ -50,13 +50,18 @@ the frame now is the one thread that submits the title's work to the card
 
 | Switch | What it does |
 |---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own |
 | `VICTORY_OUTPUT=<w>x<h>`, `VICTORY_RENDER_SCALE` | The title's output size (it renders for 4K otherwise) and its upscaler's render scale |
 | `VICTORY_FRAME_INTERVAL_MS` | The frame rate past the title's 30 fps, game clock unchanged |
+
+The parent's patches 1 (the constants heap read in place), 5 (constant buffers
+read as raw bytes), 6 (the write guards' shared lock) and 7 (the journal in parts,
+heaps' records asked for at submit) are not in this fork. Measured on the
+RTX 5070 at 1080p (2-minute runs, 2026-11-26; median ms a frame, baseline 138):
+patch 1 258 and patches 1+5 206 (the card reads the title's constants over PCIe,
+and patch 5 put no constant buffer in place in this build of the title); 6 and 7
+showed no difference within the runs' noise. Patch 2 (125, its heap compare
+4 -> 1 ms a frame) stays.
 
 What was known to be wrong there:
 
