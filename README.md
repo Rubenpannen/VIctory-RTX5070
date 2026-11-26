@@ -84,6 +84,7 @@ the frame now is the one thread that submits the title's work to the card
 |---|---|
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores report the slots they write, instead of a scan of ~600,000 slots a frame |
 | `VICTORY_OUTPUT=<w>x<h>`, `VICTORY_RENDER_SCALE` | The title's output size (it renders for 4K otherwise) and its upscaler's render scale |
+| `VICTORY_UI_PLANE=1` | Below 4K output, the interface on a 3840x2160 plane of its own, scaled over the scene: the settings menu, subtitles and prompts no longer keep their 4K size (from avatarmanz pull request #295) |
 | `VICTORY_FRAME_INTERVAL_MS` | The frame rate past the title's 30 fps, game clock unchanged |
 
 The parent's patches 1 (the constants heap read in place), 5 (constant buffers
@@ -128,7 +129,9 @@ The title renders for 2560x1440 at full scale by default (`VICTORY_OUTPUT=2560x1
 3840x2160). `-Display` picks the output size: `1920x1080`, `1664x936`, `1280x720`,
 `3840x2160`, `monitor` (this PC's main screen, if the title has a mode for it) or
 `console` (the title's own). `-RenderScale` picks the scale its upscaler renders at
-(0.5 to 1.0, or `title` for its own 2/3).
+(0.5 to 1.0, or `title` for its own 2/3). Below 4K the interface goes on a plane of
+its own at 3840x2160 (`VICTORY_UI_PLANE=1`, not with `-Safe`), since the title
+lays its menus out in 4K pixels. `-Console series-s` runs the Series S version.
 `-Log` also writes the whole log to `<data_dir>\logs\play-<date>-<time>.log`
 (`-LogFile <path>` elsewhere, outside this folder: it holds the title's data).
 

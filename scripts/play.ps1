@@ -8,6 +8,7 @@
 #               3840x2160) or 'console' (left alone: 3840x2160, as the dump's settings say)
 # -RenderScale  the title's own upscaler's scale (VICTORY_RENDER_SCALE, Series X): 1.0 (the
 #               default: it renders at the output size), 0.5 to 1.0, or 'title' (its own 2/3)
+# -Console      the console the title sees: series-x (the default) or series-s
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Log          also write the whole log to <data_dir>\logs\play-<date>-<time>.log (data_dir from
 #               victory.toml or VICTORY_DATA_DIR); -LogFile <path> writes it there instead. The log
@@ -21,6 +22,7 @@ param(
     [ValidateSet('2560x1440', '1920x1080', '1664x936', '1280x720', '3840x2160', 'monitor', 'console')]
     [string]$Display = '2560x1440',
     [ValidatePattern('^(title|0\.[5-9]\d*|1(\.0*)?)$')][string]$RenderScale = '1.0',
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [hashtable]$More = @{},
     [switch]$Log,
     [string]$LogFile = ''
@@ -43,6 +45,8 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    # Below 4K output, the interface on a 3840x2160 plane of its own (its menus are laid out in 4K pixels).
+    $settings.VICTORY_UI_PLANE = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 # The title takes its output size from its own settings (3840x2160 in a Series X dump), not from
@@ -110,13 +114,13 @@ try {
         # The log comes on the error stream: each line as text, so that PowerShell does not show
         # it as errors (red, NativeCommandError).
         $ErrorActionPreference = 'Continue'
-        & $victory run $Exe --execute 2>&1 | ForEach-Object {
+        & $victory run $Exe --execute --console $Console 2>&1 | ForEach-Object {
             $text = "$_"
             $writer.WriteLine(($text -replace "$([char]27)\[[0-9;]*m", ''))
             $text
         }
     } else {
-        & $victory run $Exe --execute
+        & $victory run $Exe --execute --console $Console
     }
 } finally {
     if ($writer) { $writer.Dispose() }

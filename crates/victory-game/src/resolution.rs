@@ -16,9 +16,7 @@
 //!   size through the copy +0x5eb24f0 makes (+0x75e6fe0). The display mode
 //!   list it matches against is its own (+0x5a38910: 1280x720, 1664x936,
 //!   1920x1080, 2560x1440, 3840x2160 at 60 Hz, table +0x615c0c0), not the
-//!   DXGI output's, which is why `VICTORY_DISPLAY_MODE` changes nothing
-//!   here. The UI does size itself by that mode, so victory-gpu reports the
-//!   size asked for here as the display mode too (`dxgi::display_size`).
+//!   DXGI output's, which is why `VICTORY_DISPLAY_MODE` changes nothing.
 //!   Here that block becomes: write the size asked for into the settings
 //!   (+0x204/+0x208), then the title's own else-path (screen size set,
 //!   +0xd8c3a0 if the height changed). Everything that reads the settings
@@ -39,6 +37,24 @@
 //!   the title divided by it (+0x28f03e8) 49 s in.
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Interface plane.** On Series X the interface is laid out in 4K
+//!   pixels: the settings menu, subtitles and button prompts keep their 4K
+//!   size at a smaller output (at 1080p twice too large, cut off at the
+//!   right and bottom). The title's UI is sized by the screen (+0x1de4030
+//!   writes it to +0x92d7924/+0x92d7928, +0x5c61a0 scales by it against
+//!   3840x2160), but its Flash menus are not. The settings' video
+//!   `uiOverlay` (+0x1e8) and `uiResolution` (+0x1ec/+0x1f0), read by the
+//!   render size +0x7b4e10 and the UI's start-up step +0x26192a0, put the
+//!   interface on a plane of its own at that size, which the display (here
+//!   `compose`, `VICTORY_PLANES`) scales over the scene, as on Series S.
+//!   `VICTORY_UI_PLANE=1` sets them (overlay on, 3840x2160) where the output
+//!   block writes the output size, through a routine in the padding at
+//!   +0x55ff290 (nothing refers to +0x55ff284..+0x55ff2c0); without it the
+//!   block clears `uiOverlay`, which the title keeps in its settings file.
+//!   The back buffers' pool (`mov ecx` at +0x247ad4a; Series S takes 82 MB
+//!   from the `mov eax` before it) is made room for both planes. From
+//!   avatarmanz/VIctory-7900XTX pull request #295 (e55673a0, UwUCammie),
+//!   which did it for 1280x720.
 
 use crate::frame_rate::Patched;
 
@@ -99,6 +115,88 @@ pub fn asked_upscaler() -> Option<u32> {
         eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected 6 (the title's own) or 7 (FidelityFX)");
     }
     kind
+}
+
+/// The size the title lays its interface out at on Series X.
+pub const UI_SIZE: (u32, u32) = (3840, 2160);
+
+/// `VICTORY_UI_PLANE=1`: the interface on a plane of its own at
+/// [`UI_SIZE`], scaled over a smaller output (see the module's notes; off
+/// without it). Says why when it cannot be.
+pub fn asked_ui_plane(output: (u32, u32)) -> bool {
+    let asked = std::env::var("VICTORY_UI_PLANE").ok().as_deref() == Some("1");
+    let planes_off = std::env::var_os("VICTORY_PLANES").is_some_and(|v| v == "0");
+    if asked && planes_off && output != UI_SIZE {
+        eprintln!("VIctory: VICTORY_UI_PLANE=1 needs the plane compositor, which VICTORY_PLANES=0 turns off: the interface stays on the scene");
+    }
+    ui_plane_applies(output, asked, planes_off)
+}
+
+/// Whether an interface plane is made: asked for, an output smaller than
+/// the interface, and a compositor to show it.
+pub fn ui_plane_applies(output: (u32, u32), asked: bool, planes_off: bool) -> bool {
+    asked && !planes_off && output != UI_SIZE
+}
+
+/// The title's video settings, as offsets from them: `uiOverlay` (a byte)
+/// and `uiResolution`'s width and height.
+pub const UI_OVERLAY: u32 = 0x1e8;
+pub const UI_WIDTH: u32 = 0x1ec;
+pub const UI_HEIGHT: u32 = 0x1f0;
+
+const SERIES_X_POOL: [u8; 4] = (64u32 << 20).to_le_bytes();
+
+/// +0x247ad10: `mov ecx, 64 MB`'s constant, the back buffers' pool on
+/// Series X (the `mov eax` before it holds Series S's 82 MB).
+pub const POOL: Site = Site {
+    at: 0x247ad4b,
+    what: "back buffer pool's size (Series X)",
+    bytes: &SERIES_X_POOL,
+};
+
+/// The pool with an interface plane: the 64 MB the title sizes for 4K (now
+/// the interface's), the scene's share of that at `width` x `height`, and
+/// 8 MB to spare, in whole 2 MB; at least Series S's 82 MB.
+pub fn ui_plane_pool(width: u32, height: u32) -> u32 {
+    const MB: u64 = 1 << 20;
+    let scene = (64 * MB * u64::from(width) * u64::from(height)).div_ceil(3840 * 2160 * MB);
+    let mb = (64 + scene + 8).next_multiple_of(2).max(82);
+    (mb * MB) as u32
+}
+
+const PADDING: [u8; 40] = [0xcc; 40];
+
+/// Padding between two functions (+0x55ff284 to +0x55ff2c0; no code or data
+/// refers into it): the two routines the output block calls.
+pub const SPARE: Site = Site {
+    at: 0x55ff290,
+    what: "padding, for the interface plane's settings",
+    bytes: &PADDING,
+};
+
+/// Where in [`SPARE`] the routine that turns `uiOverlay` off begins.
+pub const UI_OFF_AT: usize = 32;
+
+/// What goes at [`SPARE`]: at its start `mov byte [rsi+uiOverlay], 1 ;
+/// mov dword [rsi+uiResolution], 3840x2160 ; ret`, at [`UI_OFF_AT`]
+/// `mov byte [rsi+uiOverlay], 0 ; ret` (rsi: the settings, in the output
+/// block).
+pub fn spare_code() -> Vec<u8> {
+    let mut c = vec![0xc6, 0x86];
+    c.extend(UI_OVERLAY.to_le_bytes());
+    c.push(1);
+    for (field, value) in [(UI_WIDTH, UI_SIZE.0), (UI_HEIGHT, UI_SIZE.1)] {
+        c.extend([0xc7, 0x86]);
+        c.extend(field.to_le_bytes());
+        c.extend(value.to_le_bytes());
+    }
+    c.push(0xc3);
+    c.resize(UI_OFF_AT, 0xcc);
+    c.extend([0xc6, 0x86]);
+    c.extend(UI_OVERLAY.to_le_bytes());
+    c.extend([0, 0xc3]);
+    c.resize(SPARE.bytes.len(), 0xcc);
+    c
 }
 
 /// A place to change: its offset in the image and the bytes there
@@ -194,10 +292,15 @@ fn rel(to: usize, next: usize) -> [u8; 4] {
     ((to as i64 - next as i64) as i32).to_le_bytes()
 }
 
-/// What goes at [`OUTPUT`] for `width` x `height` (the same length).
-pub fn output_code(width: u32, height: u32) -> Vec<u8> {
+/// What goes at [`OUTPUT`] for `width` x `height` (the same length), first
+/// calling `routine` (an image offset, one of [`SPARE`]'s) if given.
+pub fn output_code(width: u32, height: u32, routine: Option<usize>) -> Vec<u8> {
     let at = OUTPUT.at;
     let mut c = Vec::with_capacity(OUTPUT.bytes.len());
+    if let Some(routine) = routine {
+        c.push(0xe8); // call routine (rsi: the settings; changes no register)
+        c.extend(rel(routine, at + c.len() + 4));
+    }
     c.push(0xb8); // mov eax, width
     c.extend(width.to_le_bytes());
     c.extend([0x89, 0x86, 0x04, 0x02, 0x00, 0x00]); // mov [rsi+204h], eax
@@ -301,7 +404,29 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
-        asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+        let plane_asked = asked_ui_plane((w, h));
+        // The routines the output block calls go in first; the block calls
+        // one only if they did (else it is as it was before them).
+        // SAFETY: the caller's promise.
+        let spare = unsafe { write(base, size, &SPARE, &spare_code()) };
+        report(&SPARE, spare, if plane_asked { "interface plane on" } else { "interface plane off" });
+        let ready = spare == Patched::Done;
+        // SAFETY: as above.
+        let plane = plane_asked && ready && unsafe { matches(base, size, &POOL) } == Patched::Done;
+        if plane_asked && !plane {
+            println!("resolution: no interface plane (the bytes at its places are not the ones expected): the interface stays on the scene");
+        }
+        let routine = ready.then_some(if plane { SPARE.at } else { SPARE.at + UI_OFF_AT });
+        let value = if plane {
+            format!("{w}x{h}, the interface at {}x{} on a plane of its own", UI_SIZE.0, UI_SIZE.1)
+        } else {
+            format!("{w}x{h}")
+        };
+        asked.push((&OUTPUT, output_code(w, h, routine), value));
+        if plane {
+            let pool = ui_plane_pool(w, h);
+            asked.push((&POOL, pool.to_le_bytes().to_vec(), format!("{} MB for both planes", pool >> 20)));
+        }
         if (w, h) != (3840, 2160) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
@@ -318,14 +443,20 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
-        let offset = format!("{:#x}", site.at);
-        match done {
-            Patched::Done => tracing::info!(site = %offset, what = site.what, value, "resolution: patched"),
-            Patched::Differs => tracing::warn!(site = %offset, what = site.what, "resolution: not patched, the title's bytes there are not the ones expected (another build?)"),
-            Patched::Failed(why) => tracing::warn!(site = %offset, what = site.what, why, "resolution: not patched"),
-        }
-        println!("resolution: {} ({value}) at title+{offset}: {done:?}", site.what);
+        report(site, done, &value);
     }
+}
+
+/// A line in the log and on standard output for a site written or not.
+#[cfg(windows)]
+fn report(site: &Site, done: Patched, value: &str) {
+    let offset = format!("{:#x}", site.at);
+    match done {
+        Patched::Done => tracing::info!(site = %offset, what = site.what, value, "resolution: patched"),
+        Patched::Differs => tracing::warn!(site = %offset, what = site.what, "resolution: not patched, the title's bytes there are not the ones expected (another build?)"),
+        Patched::Failed(why) => tracing::warn!(site = %offset, what = site.what, why, "resolution: not patched"),
+    }
+    println!("resolution: {} ({value}) at title+{offset}: {done:?}", site.what);
 }
 
 #[cfg(test)]
@@ -365,25 +496,70 @@ mod tests {
 
     #[test]
     fn the_output_code_keeps_the_titles_else_path() {
-        let c = output_code(1920, 1080);
-        assert_eq!(c.len(), OUTPUT.bytes.len());
-        assert_eq!(c[0], 0xb8);
-        assert_eq!(c[1..5], 1920u32.to_le_bytes());
-        assert_eq!(c[5..11], [0x89, 0x86, 0x04, 0x02, 0x00, 0x00]);
-        assert_eq!(c[12..16], 1080u32.to_le_bytes());
-        assert_eq!(c[16..22], [0x89, 0xbe, 0x08, 0x02, 0x00, 0x00]);
-        let target = |op_end: usize| (OUTPUT.at + op_end) as i64 + i64::from(i32::from_le_bytes(c[op_end - 4..op_end].try_into().unwrap()));
-        assert_eq!(c[22..24], [0x8b, 0x2d]);
-        assert_eq!(target(28), SCREEN_HEIGHT as i64);
-        assert_eq!(c[32], 0xe8);
-        assert_eq!(target(37), SET_SCREEN_SIZE as i64);
-        assert_eq!(c[37..40], [0x39, 0xfd, 0x74]);
-        assert_eq!(41 + c[40] as usize, 61, "je lands at the end");
-        assert_eq!(c[43], 0xe8);
-        assert_eq!(target(48), HEIGHT_CHANGED as i64);
-        assert_eq!(c[48], 0xeb);
-        assert_eq!(50 + c[49] as usize, 61, "jmp lands at the end");
-        assert!(c[50..].iter().all(|&x| x == 0xcc));
+        // Without a routine, and after a call to either of the two.
+        for (routine, k) in [(None, 0), (Some(SPARE.at), 5), (Some(SPARE.at + UI_OFF_AT), 5)] {
+            let c = output_code(1920, 1080, routine);
+            assert_eq!(c.len(), OUTPUT.bytes.len());
+            let target = |op_end: usize| (OUTPUT.at + op_end) as i64 + i64::from(i32::from_le_bytes(c[op_end - 4..op_end].try_into().unwrap()));
+            if let Some(routine) = routine {
+                assert_eq!(c[0], 0xe8);
+                assert_eq!(target(5), routine as i64, "the call reaches the routine");
+            }
+            assert_eq!(c[k], 0xb8);
+            assert_eq!(c[k + 1..k + 5], 1920u32.to_le_bytes());
+            assert_eq!(c[k + 5..k + 11], [0x89, 0x86, 0x04, 0x02, 0x00, 0x00]);
+            assert_eq!(c[k + 12..k + 16], 1080u32.to_le_bytes());
+            assert_eq!(c[k + 16..k + 22], [0x89, 0xbe, 0x08, 0x02, 0x00, 0x00]);
+            assert_eq!(c[k + 22..k + 24], [0x8b, 0x2d]);
+            assert_eq!(target(k + 28), SCREEN_HEIGHT as i64);
+            assert_eq!(c[k + 32], 0xe8);
+            assert_eq!(target(k + 37), SET_SCREEN_SIZE as i64);
+            assert_eq!(c[k + 37..k + 40], [0x39, 0xfd, 0x74]);
+            assert_eq!(k + 41 + c[k + 40] as usize, 61, "je lands at the end");
+            assert_eq!(c[k + 43], 0xe8);
+            assert_eq!(target(k + 48), HEIGHT_CHANGED as i64);
+            assert_eq!(c[k + 48], 0xeb);
+            assert_eq!(k + 50 + c[k + 49] as usize, 61, "jmp lands at the end");
+            assert!(c[k + 50..].iter().all(|&x| x == 0xcc));
+        }
+    }
+
+    /// The two routines: overlay on with the interface's size, overlay off;
+    /// each ends in `ret` and stays inside the padding.
+    #[test]
+    fn the_spare_routines_set_the_interface_plane() {
+        let c = spare_code();
+        assert_eq!(c.len(), SPARE.bytes.len());
+        assert!(SPARE.at + c.len() <= 0x55ff2c0, "inside the padding");
+        assert_eq!(c[..7], [0xc6, 0x86, 0xe8, 0x01, 0x00, 0x00, 0x01], "mov byte [rsi+uiOverlay], 1");
+        assert_eq!(c[7..13], [0xc7, 0x86, 0xec, 0x01, 0x00, 0x00]);
+        assert_eq!(c[13..17], 3840u32.to_le_bytes());
+        assert_eq!(c[17..23], [0xc7, 0x86, 0xf0, 0x01, 0x00, 0x00]);
+        assert_eq!(c[23..27], 2160u32.to_le_bytes());
+        assert_eq!(c[27], 0xc3);
+        assert!(c[28..UI_OFF_AT].iter().all(|&x| x == 0xcc));
+        assert_eq!(c[UI_OFF_AT..UI_OFF_AT + 8], [0xc6, 0x86, 0xe8, 0x01, 0x00, 0x00, 0x00, 0xc3], "mov byte [rsi+uiOverlay], 0 ; ret");
+        assert!(c[UI_OFF_AT + 8..].iter().all(|&x| x == 0xcc));
+    }
+
+    #[test]
+    fn the_pool_holds_both_planes() {
+        assert_eq!(POOL.bytes, (64u32 << 20).to_le_bytes());
+        assert_eq!(ui_plane_pool(1280, 720) >> 20, 82, "Series S's at least");
+        assert_eq!(ui_plane_pool(1920, 1080) >> 20, 88);
+        assert_eq!(ui_plane_pool(2560, 1440) >> 20, 102);
+        for (w, h) in MODES {
+            assert!(ui_plane_pool(w, h) >= 82 << 20);
+        }
+    }
+
+    #[test]
+    fn the_interface_plane_only_below_its_size_and_with_the_compositor() {
+        assert!(ui_plane_applies((1920, 1080), true, false));
+        assert!(ui_plane_applies((2560, 1440), true, false));
+        assert!(!ui_plane_applies((1920, 1080), false, false), "off unless asked");
+        assert!(!ui_plane_applies((1920, 1080), true, true), "VICTORY_PLANES=0");
+        assert!(!ui_plane_applies(UI_SIZE, true, false), "4K needs none");
     }
 
     #[test]
