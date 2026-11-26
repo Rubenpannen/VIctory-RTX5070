@@ -5176,7 +5176,11 @@ mod tests {
     fn views_count_from_the_first_level_of_the_host_copy() {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
-            desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
+            // SAFETY: the member its dimension says.
+            let texture = unsafe { desc.Anonymous.Texture2D };
+            desc.Anonymous = D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { ResourceMinLODClamp: clamp, ..texture },
+            };
             from_base(&mut desc, 3);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };

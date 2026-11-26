@@ -386,7 +386,7 @@ fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE};
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
-    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
     use windows_sys::Win32::System::Threading::CreateEventW;
     /// Set when this thread's read is done.
     struct Event(HANDLE);
@@ -405,9 +405,13 @@ fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io
         if done.0.is_null() {
             return Err(std::io::Error::last_os_error());
         }
-        let mut overlapped = OVERLAPPED { hEvent: done.0, ..Default::default() };
-        overlapped.Anonymous.Anonymous.Offset = offset as u32;
-        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        let mut overlapped = OVERLAPPED {
+            hEvent: done.0,
+            Anonymous: OVERLAPPED_0 {
+                Anonymous: OVERLAPPED_0_0 { Offset: offset as u32, OffsetHigh: (offset >> 32) as u32 },
+            },
+            ..Default::default()
+        };
         let len = out.len().min(1 << 30) as u32;
         let mut n = 0;
         // SAFETY: `out` and `overlapped` stay until the read is done, which
