@@ -3722,6 +3722,16 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    // A constant buffer view on a copy of its own bytes ([`constant_home`]): that copy. Others
+    // on their buffer's copy are not brought up to date here, as before.
+    if let &View::Constant(address, size) = view {
+        let theirs = crate::shadow::find(address, u64::from(size))?;
+        if theirs.gpu(address).is_multiple_of(256) {
+            return None;
+        }
+        let (copy, _) = constant_home(address, size)?;
+        return Some((copy, address, u64::from(size)));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -3737,6 +3747,22 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     }
     let shadow = crate::shadow::find(address, len)?;
     Some((view_home(shadow, address, len, view_elements(view)?), address, len))
+}
+
+/// The host copy a constant buffer view of `size` bytes at `address` is made on, and the
+/// view's address there: its buffer's copy, or where the view is not on 256 bytes of that copy
+/// (the host's alignment; the console needs 16) a copy of its own bytes, which starts at
+/// `address` ([`crate::shadow::exact`]). Such a view was left null, its shaders read zeros
+/// (`0x28969540`, 64 bytes past 256, in the RTX 5070's runs of 2026-11-26).
+fn constant_home(address: u64, size: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64)> {
+    let shadow = crate::shadow::find(address, u64::from(size))?;
+    let gpu = shadow.gpu(address);
+    if gpu.is_multiple_of(256) {
+        return Some((shadow, gpu));
+    }
+    let own = crate::shadow::exact(address, u64::from(size))?;
+    let gpu = own.gpu(address);
+    gpu.is_multiple_of(256).then_some((own, gpu))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -4286,15 +4312,13 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
+            let Some((shadow, gpu)) = constant_home(address, size) else {
                 once!(
                     address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
+                    "constant buffer not 256-byte aligned on the host, and no copy of its own"
                 );
                 return None;
-            }
+            };
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
                 SizeInBytes: constant_bytes(size),
@@ -5581,6 +5605,37 @@ mod tests {
         assert!(off_elements(56, 56, false, 0, false));
         assert!(!off_elements(56, 56, false, 0, true));
         assert!(!off_elements(112, 56, false, 0, false));
+    }
+
+    /// A constant buffer view 64 bytes into its buffer's copy (the host needs 256) is made
+    /// on a copy of its own bytes, which starts at the view, and that copy is the one brought
+    /// up to date for it; a view on 256 bytes stays on its buffer's copy, which is not brought
+    /// up to date here.
+    #[test]
+    fn a_constant_buffer_view_off_256_bytes_gets_a_copy_of_its_own() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let Some(heap) = HostHeap::new(false, 2) else {
+            return;
+        };
+        let memory = vec![0u64; 1 << 13];
+        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let key = start as usize;
+        crate::shadow::register(key, start, 4096);
+        let off = View::Constant(start + 64, 256);
+        let on = View::Constant(start, 256);
+        let made = (make(&off, heap.cpu(0)), make(&on, heap.cpu(1)));
+        let refreshed = (buffer_copy(&off), buffer_copy(&on));
+        let theirs = crate::shadow::find(start, 4096);
+        crate::shadow::unregister(key, start);
+        let made_off = made.0.expect("a view").expect("a buffer");
+        let (copy, address, bytes) = refreshed.0.expect("its own copy, brought up to date");
+        assert_eq!((copy.span(), address, bytes), ((start + 64, 256), start + 64, 256));
+        assert_eq!(made_off, copy.buffer, "the descriptor and the refresh share a copy");
+        let made_on = made.1.expect("a view").expect("a buffer");
+        assert!(refreshed.1.is_none());
+        assert_eq!(Some(made_on), theirs.map(|s| s.buffer.clone()), "its buffer's copy");
     }
 
     /// Such a view is made on a copy of its own bytes, and that copy is the one
