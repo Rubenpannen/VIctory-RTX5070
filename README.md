@@ -34,12 +34,17 @@ i9-12900K, 64 GB RAM, Radeon RX 7900 XTX, the Series X profile, ray tracing off.
 
 | | |
 |---|---|
-| City street, renderer patches 1+2 on | about 53 ms a frame (about 19 fps) |
+| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
+| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
+| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
+| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
 | Same scene before the patches | 57-75 ms (13-17 fps) |
 | Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 35 GB of private memory: **64 GB of RAM recommended** for now |
+| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
 
-It started at 280 ms a frame in the same scenes three days earlier.
+It started at 280 ms a frame in the same scenes three days earlier. What sets
+the frame now is the one thread that submits the title's work to the card
+(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
 
 ### Its renderer patches (off by default while they are tested)
 
@@ -48,6 +53,8 @@ It started at 280 ms a frame in the same scenes three days earlier.
 | `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores report the slots they write, instead of a scan of ~600,000 slots a frame |
 | `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes |
+| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it |
+| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own |
 | `VICTORY_OUTPUT=<w>x<h>`, `VICTORY_RENDER_SCALE` | The title's output size (it renders for 4K otherwise) and its upscaler's render scale |
 | `VICTORY_FRAME_INTERVAL_MS` | The frame rate past the title's 30 fps, game clock unchanged |
 
