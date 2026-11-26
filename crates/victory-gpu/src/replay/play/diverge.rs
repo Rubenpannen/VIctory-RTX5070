@@ -1214,7 +1214,9 @@ impl Player {
                 word(if s.kind == slot::SRV { 4 } else { 2 }),
                 word(if s.kind == slot::SRV { 6 } else { 4 }),
                 word(if s.kind == slot::SRV { 7 } else { 5 }),
-                word(if s.kind == slot::SRV { 8 } else { 8 }),
+                // (Both kinds' flags are word 8: a view of unordered access has
+                // a 64-bit counter offset before them.)
+                word(8),
             ),
         }
     }
