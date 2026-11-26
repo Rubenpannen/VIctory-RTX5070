@@ -1216,7 +1216,11 @@ const BATCHES: u32 = 8;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Replaced at a reset after a long recording ([`allocator_renew_at`]).
+    allocator: Mutex<ID3D12CommandAllocator>,
+    /// The title's calls recorded since the last reset
+    /// ([`HostList::recorded_call`]).
+    calls: AtomicU32,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
@@ -1276,6 +1280,35 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Above how many of the title's calls a host list's recording has its
+/// allocator replaced by a new one at the list's reset
+/// (`VICTORY_ALLOCATOR_RENEW=<calls>`, 512; `0`: never, as before).
+///
+/// A command allocator keeps the memory its longest recording grew it to
+/// across resets, and host lists that have run go into one pool
+/// (`crate::list::recycle`) from which any recording takes any of them. So
+/// over a session every pooled list's allocator grows to the size of the
+/// longest recordings: the RX 7900 XTX run had 9 GB in lists' allocators.
+/// On the RTX 5070 (probe of 2026-11-26) an allocator holds about 0.8 KB of
+/// the process's memory and 0.7 KB of the card's per recorded root constants
+/// and dispatch, and its reset gives none of it back. A released allocator's
+/// memory goes back to the driver, which hands it to the next allocator
+/// that grows: no less memory is in use than the peak, but it stops spreading
+/// to every list. Recording into an allocator that grows from what the
+/// driver keeps was as fast as into one already grown (77 against 80 ms for
+/// 800,000 calls; into new memory: 260 ms). A renewal costs about 3 us.
+fn allocator_renew_at() -> Option<u32> {
+    static AT: OnceLock<u32> = OnceLock::new();
+    let at = *AT.get_or_init(|| {
+        std::env::var("VICTORY_ALLOCATOR_RENEW").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512)
+    });
+    (at != 0).then_some(at)
+}
+
+/// Host lists whose allocator was renewed at a reset since the start
+/// ([`allocator_renew_at`]).
+pub(crate) static LISTS_RENEWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -4182,7 +4215,8 @@ impl Host {
                 );
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new(allocator),
+                calls: AtomicU32::new(0),
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -6406,17 +6440,35 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+        let calls = self.calls.swap(0, Ordering::Relaxed);
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = allocator_renew_at()
+            .filter(|&at| calls > at)
+            .and_then(|_| host())
+            // SAFETY: plain object creation.
+            .and_then(|h| unsafe { h.device.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT) }.ok());
+        // SAFETY: the list is not executing, so neither allocator is in use.
+        let reset = match fresh {
+            Some(fresh) => unsafe { self.list.Reset(&fresh, None) }.map(|()| {
+                // The old one, with the memory the long recording grew it
+                // to, goes back to the driver.
+                *allocator = fresh;
+                LISTS_RENEWED.fetch_add(1, Ordering::Relaxed);
+            }),
+            None => unsafe { allocator.Reset().and_then(|()| self.list.Reset(&*allocator, None)) },
         };
+        drop(allocator);
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// One call of the title's recorded into this list (counted for
+    /// [`allocator_renew_at`]).
+    pub(crate) fn recorded_call(&self) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Something changed in this list that bringing a draw's textures and

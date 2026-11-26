@@ -177,14 +177,19 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// The host list behind a title list, if there is a host GPU.
+/// The host list behind a title list, if there is a host GPU. Each ask is
+/// counted as a call recorded into it (`crate::host::HostList::recorded_call`).
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    let host = unsafe { (*this.cast::<List>()).host.as_ref() };
+    if let Some(host) = host {
+        host.recorded_call();
+    }
+    host
 }
 
 /// The host side of a submitted list, taken from it: a queue that waits
