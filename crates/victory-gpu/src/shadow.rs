@@ -169,8 +169,12 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - Unknown (`None`, e.g. WARP) or `< 10 GiB` (8 GB cards): `(16, 512)` MiB.
+/// - `>= 10 GiB` and `<= 12 GiB` (12 GB cards, whose WDDM budget is about
+///   11 GiB): `(1, 2048)` MiB. On the RTX 5070 (budget 11,176 MB) the copies
+///   from 16 MiB up, 512 MB at most, left 349 MB a frame of the copies from
+///   1 MiB up to snapshots and compares on the CPU (43 ms of the submitting
+///   thread); with these 28 MB, and median frames 190 -> 114 ms.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
@@ -181,10 +185,13 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
+    const TEN_GIB_MB: u64 = 10 * 1024;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
-    if budget_mb <= TWELVE_GIB_MB {
+    if budget_mb < TEN_GIB_MB {
         (16, 512)
+    } else if budget_mb <= TWELVE_GIB_MB {
+        (1, 2048)
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -5883,11 +5890,14 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure) and 8 GB cards keep the small baseline.
         assert_eq!(default_card_limits_mb(None), (16, 512));
         assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(9 * GIB)), (16, 512));
+        // 12 GB tier (WDDM budget about 11 GiB, the RTX 5070's 11,176 MB).
+        assert_eq!(default_card_limits_mb(Some(10 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(11176 * MIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 2048));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
