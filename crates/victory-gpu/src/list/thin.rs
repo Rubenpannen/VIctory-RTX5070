@@ -357,6 +357,8 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    #[cfg(feature = "diagnostics")]
+    op_line(frames);
 }
 
 #[inline]
@@ -398,6 +400,9 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
+        /// Their names, by number (for [`op_line`]).
+        #[cfg(feature = "diagnostics")]
+        const PLAIN_NAMES: &[&str] = &[$(stringify!($op)),*];
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -469,6 +474,57 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+#[cfg(feature = "diagnostics")]
+const OTHER_NAMES: [&str; 17] = [
+    "RESET", "CLOSE", "UPLOAD", "BARRIER", "BARRIER_GROUPS", "VIEWPORTS", "SCISSORS", "BLEND_FACTOR", "HEAPS",
+    "COMPUTE_CONSTANTS", "GRAPHICS_CONSTANTS", "INDEX_BUFFER", "VERTEX_BUFFERS", "TARGETS", "CLEAR_RTV", "CLEAR_DSV",
+    "COPY_TEXTURE",
+];
+
+/// Diagnostics: the calls of each kind translated and the nanoseconds they
+/// took (all threads), by op number; printed per frame by [`op_line`].
+#[cfg(feature = "diagnostics")]
+static OP_STATS: [[AtomicU64; 2]; 64] = [const { [const { AtomicU64::new(0) }; 2] }; 64];
+
+/// Diagnostics: the kinds of list calls that took the most of the
+/// translating threads' time, per frame. (How `shadow::exact`'s lock was
+/// found: ExecuteIndirect at 480 us a call on the RTX 5070.)
+#[cfg(feature = "diagnostics")]
+fn op_line(frames: f64) {
+    let mut v: Vec<(String, f64, f64)> = (0..64u64)
+        .filter_map(|op| {
+            let n = OP_STATS[op as usize][0].swap(0, Relaxed);
+            let ns = OP_STATS[op as usize][1].swap(0, Relaxed);
+            (n > 0).then(|| {
+                let name = if (op as usize) < PLAIN_NAMES.len() {
+                    PLAIN_NAMES[op as usize].to_string()
+                } else {
+                    OTHER_NAMES.get((op - Plain::END as u64) as usize).map_or(format!("op{op}"), |n| n.to_string())
+                };
+                (name, n as f64 / frames, ns as f64 / 1e6 / frames)
+            })
+        })
+        .collect();
+    v.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let text: Vec<String> = v
+        .iter()
+        .take(12)
+        .map(|(name, n, ms)| format!("{name} {n:.0}x {ms:.1} ms ({:.1} us)", ms * 1000.0 / n.max(1e-9)))
+        .collect();
+    tracing::info!("list calls translated per frame by kind, the costliest (VICTORY_THIN): {}", text.join(", "));
+}
+
+/// Diagnostics: adds the time from its making to its drop to its op's.
+#[cfg(feature = "diagnostics")]
+struct OpTimer(u64, std::time::Instant);
+#[cfg(feature = "diagnostics")]
+impl Drop for OpTimer {
+    fn drop(&mut self) {
+        let slot = &OP_STATS[(self.0 as usize).min(63)];
+        slot[0].fetch_add(1, Relaxed);
+        slot[1].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -702,6 +758,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
+        #[cfg(feature = "diagnostics")]
+        let _timed = OpTimer(op, std::time::Instant::now());
         if run_plain(op, list, w) {
             continue;
         }

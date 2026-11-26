@@ -5663,16 +5663,141 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    if !exact_pool() {
+        return exact_locked(address, len);
+    }
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    // Nearly every asking finds its copy: under the read lock, which the
+    // threads that translate lists share.
+    if let Some(found) = exact_hit(address, len, now) {
+        return Some(found);
+    }
+    // A new copy. Its buffer is taken from those of copies let go, or made
+    // with no lock held: making a committed resource takes the NVIDIA
+    // driver hundreds of microseconds to milliseconds, and under the one
+    // lock every other asking waited for it (RTX 5070, 2,900 askings a
+    // frame: 2.4 s of the translating threads' time, 820 us each; with
+    // this, 10 ms; frames 420 -> 190 ms).
+    // In powers of two, so that a buffer let go fits the next copies of
+    // about its size (ring positions change every frame, the sizes do not).
+    let size = len.next_power_of_two().max(256);
+    let (buffer, data) = match exact_pooled(size) {
+        Some(b) => b,
+        None => {
+            let made = host()?.shared_buffer(size)?;
+            EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+            made
+        }
+    };
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut gone = Vec::new();
+    {
+        let mut map = EXACT_MAP.write().unwrap_or_else(|e| e.into_inner());
+        // Another thread may have made it meanwhile: theirs is the one.
+        if let Some((theirs, used)) = map.get(&(address, len)) {
+            used.store(now, Ordering::Relaxed);
+            let theirs = theirs.clone();
+            drop(map);
+            exact_give_back(shadow);
+            return Some(theirs);
+        }
+        map.insert((address, len), (shadow.clone(), AtomicU64::new(now)));
+        // The idle ones (held by the map alone, their buffer by the copy
+        // alone, not asked for lately) are looked for after some new
+        // copies, not at every one: a look goes through all of them, two
+        // COM calls each. Their buffers go to the pool for the next ones.
+        if map.len() >= EXACT_SWEEP.load(Ordering::Relaxed) {
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, (shadow, used))| {
+                    Arc::strong_count(shadow) == 1
+                        && crate::host::references(&shadow.buffer) <= 1
+                        && used.load(Ordering::Relaxed) + EXACT_LATELY <= now
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            gone.extend(idle.into_iter().filter_map(|key| map.remove(&key)).map(|(shadow, _)| shadow));
+            EXACT_SWEEP.store((map.len() + (map.len() / 16).max(64)).max(EXACT_MANY), Ordering::Relaxed);
+        }
+    }
+    OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    for idle in gone {
+        exact_give_back(idle);
+    }
+    Some(shadow)
+}
+
+/// Copies kept before the idle ones are first looked for, and the askings
+/// an idle one stays for.
+const EXACT_MANY: usize = 256;
+const EXACT_LATELY: u64 = 512;
+
+/// `VICTORY_EXACT_POOL=0`: [`exact`] as before, one lock for hits and new
+/// copies, buffers made under it, the idle copies looked for at every new
+/// one past 256.
+fn exact_pool() -> bool {
+    crate::toggled!("VICTORY_EXACT_POOL")
+}
+
+/// [`exact`]'s copies, each with the asking that last took it.
+#[allow(clippy::type_complexity)]
+static EXACT_MAP: RwLock<BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>> = RwLock::new(BTreeMap::new());
+static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
+static EXACT_SWEEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(EXACT_MANY);
+
+/// A buffer of a copy let go, for a new one: its bytes, it, its mapping.
+struct Pooled(u64, ID3D12Resource, usize);
+static EXACT_BUFFERS: Mutex<Vec<Pooled>> = Mutex::new(Vec::new());
+
+fn exact_hit(address: u64, len: u64, now: u64) -> Option<Arc<Shadow>> {
+    let map = EXACT_MAP.read().unwrap_or_else(|e| e.into_inner());
+    let (shadow, used) = map.get(&(address, len))?;
+    used.store(now, Ordering::Relaxed);
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    Some(shadow.clone())
+}
+
+/// A buffer of `size` bytes from a copy let go.
+fn exact_pooled(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut pool = EXACT_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let at = pool.iter().rposition(|p| p.0 == size)?;
+    let Pooled(_, buffer, data) = pool.swap_remove(at);
+    Some((buffer, data as *mut u8))
+}
+
+/// A copy nothing holds any more: its buffer (which nothing else names; it
+/// stays mapped) goes to the pool.
+fn exact_give_back(shadow: Arc<Shadow>) {
+    const MOST: usize = 2048;
+    let Ok(shadow) = Arc::try_unwrap(shadow) else {
+        return;
+    };
+    if shadow.card.is_some() || shadow.place.is_some() || crate::host::references(&shadow.buffer) > 1 {
+        return;
+    }
+    let pooled = Pooled(shadow.width(), shadow.buffer.clone(), shadow.data as usize);
+    drop(shadow);
+    let mut pool = EXACT_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() < MOST {
+        pool.push(pooled);
+    }
+}
+
+/// [`exact`] as it was (`VICTORY_EXACT_POOL=0`).
+fn exact_locked(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    /// Copies kept before the idle ones are looked for, and the askings an
+    /// idle one stays for.
+    const MANY: usize = 256;
+    const LATELY: u64 = 512;
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (tick, map) = &mut *guard;
     *tick += 1;
@@ -5711,10 +5836,16 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = if exact_pool() {
+        EXACT_MAP.read().unwrap_or_else(|e| e.into_inner()).len()
+    } else {
+        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len()
+    };
+    let pooled = EXACT_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} buffers made for them per frame, {kept} kept, {pooled} buffers of copies let go \
+         ready for new ones (VICTORY_EXACT_POOL=0: one lock, buffers made under it)",
         asked as f64 / frames,
         made as f64 / frames
     );
