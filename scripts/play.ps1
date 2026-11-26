@@ -30,6 +30,8 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
+    # The pipelines the title creates are written down in the cache folder, for `victory warm --used`.
+    VICTORY_PIPELINE_BOOK = '1'
     # A compute program whose approximate wave64 form hung the card (docs/findings.md); only the
     # diagnostics build (-Build diag) can skip it.
     VICTORY_SKIP_PIPELINES = '2561af9577c47289'
