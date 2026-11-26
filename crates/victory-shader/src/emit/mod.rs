@@ -553,7 +553,20 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_on = wide_option.as_ref().is_some_and(|v| v == "1");
+        // Unset, one narrower case is widened all the same: a console compute program
+        // (`ACCC`) refused only because a lane mask is exchanged where not every lane runs,
+        // inside a loop that runs until every lane is done (a single backward latch on the
+        // SCC of `s_andn2_wrexec_b64`; [`widen`] checks it). The console wave goes round
+        // again while either host half has lanes left; each vector write keeps its EXEC.
+        // Programs that translate otherwise are not touched. `VICTORY_WAVE_WIDE=0`: not.
+        // (From codec-d/cool_fox 8cc31ab, without its two title shaders widened by digest.)
+        let active_loop = wide_option.is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC::ACCC).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -575,7 +588,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on || active_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -583,8 +596,8 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
-                        report("wave-wide branches", &again);
+                        let again = widen(c, native, base, why, !wide_on);
+                        report(if wide_on { "wave-wide branches" } else { "wave-wide active-lane loop" }, &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
                         }
@@ -645,7 +658,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -676,12 +689,14 @@ pub fn emit(
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
 /// it translates or a branch cannot be widened. Only where a thread group is one console
 /// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// such a branch would wait for threads that never come. `active_loop_only`: nothing but one
+/// loop that runs until every lane is done is widened, or it gives up.
 fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -728,6 +743,31 @@ fn widen(
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
             return r;
+        }
+        if active_loop_only {
+            // One backward branch on the SCC that `s_andn2_wrexec_b64` just set, having taken
+            // the finished lanes out of EXEC: the console repeats the loop while either half
+            // still has lanes, and each vector write keeps its EXEC.
+            let [latch] = more.as_slice() else {
+                return r;
+            };
+            let block = &p.blocks[*latch];
+            let [.., update, branch] = block.insts.as_slice() else {
+                return r;
+            };
+            if !wide.is_empty()
+                || update.name() != "s_andn2_wrexec_b64"
+                || branch.name() != "s_cbranch_scc1"
+                || !matches!(
+                    block.exit,
+                    ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+                )
+            {
+                if why {
+                    eprintln!("WAVE64-WIDE not tried: not a single loop that runs until every lane is done");
+                }
+                return r;
+            }
         }
         wide.extend(more);
     }
