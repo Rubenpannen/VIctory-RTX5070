@@ -14,8 +14,7 @@ or publisher.
 ## The target machine
 
 Windows 11, AMD Ryzen 9 5900X (12 cores, 24 threads), 64 GB RAM, GeForce RTX 5070
-12 GB. No measurements of this fork on it yet; the figures below are those of the
-fork it started from.
+12 GB.
 
 What differs from the machine the parent fork was tuned on, and what this fork
 has to plan around:
@@ -27,6 +26,39 @@ has to plan around:
 | Waves | AMD RDNA 3, wave32 and wave64 | NVIDIA, 32 lanes only: programs written for 64-lane waves are emulated |
 | CPU | i9-12900K, 8 fast and 8 slow cores | Ryzen 9 5900X, 12 equal cores over two dies |
 | Driver | AMD | NVIDIA: its own pipeline creation times and shader cache |
+
+## Where it stands on the RTX 5070 (2026-11-26)
+
+Same scene of the prologue each time; medians of the frame times.
+
+| | |
+|---|---|
+| The parent fork's defaults, 2560x1440 output | about 420 ms a frame |
+| Copies of single buffer views found under a read lock, their buffers reused (18ae3bd) | 190 ms |
+| On 12 GB cards, title buffers from 1 MiB up (up to 2 GB) kept on the card (a65c925) | 114 ms at 2560x1440, 96 ms at 1920x1080 |
+| 2-minute runs at 1920x1080, `scripts\play.ps1` defaults | 112-138 ms (about 7-9 fps), 125 ms with patch 2 in the same runs |
+
+The parent's defaults were tuned on a card whose driver makes buffers cheaply; the
+NVIDIA driver takes about a millisecond for each, so anything that makes buffers
+under a lock or per call costs whole frames here. The scene's own variation
+(1,000 to 6,000 draws in 5 seconds) hides differences under about 10 %.
+
+What sets the frame now, at 1920x1080:
+
+- **One wait of 30-36 ms a frame on the submitting thread.** The title copies a few
+  hundred bytes out of memory a dispatch still in flight writes, into constant
+  buffers that draws of later lists read; those are filled on the CPU at
+  submission, so the submission waits for the card. `VICTORY_PLACED_ORDER=1` ends
+  the wait, but the fills then done on the card (about 8,000 a frame) take the
+  submitting thread as long (112 -> 132 ms), so it stays off.
+- **The card itself**, about 37 ms a frame, the next wall after that.
+
+New on this fork: the 12 GB card-buffer defaults above
+(`VICTORY_CARD_BUFFERS_MIN_MB=16 VICTORY_CARD_BUFFERS_MB=512` restores the parent's),
+and, on by default with `=0` restoring the parent's way, `VICTORY_PLACED_CONSTANTS` and `VICTORY_PLACED_EXACT` (constant buffers and
+copies a copy earlier in the list writes, filled on the card),
+`VICTORY_TEXTURE_VOLATILE` (the intro video no longer jumps back in time),
+`VICTORY_TARGET_VARIANTS` (a pipeline per render-target format a draw really uses).
 
 ## Where the parent fork stood (2026-11-26, RX 7900 XTX)
 
@@ -121,8 +153,8 @@ described in a comment where it is read.
 ## What this fork inherits
 
 From the RX 7900 XTX fork; the reasons and the measurements, all of that card,
-are in [docs/findings.md](docs/findings.md). Which of them pay on the RTX 5070 is
-still to be measured.
+are in [docs/findings.md](docs/findings.md). Of its renderer patches only patch 2
+paid on the RTX 5070 (above); the rest are still to be measured one by one.
 
 - **List calls are written down, not carried out, on the title's threads**
   (`VICTORY_THIN`): eight threads of ours translate them.

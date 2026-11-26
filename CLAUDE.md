@@ -41,6 +41,7 @@ cargo build --locked --release -p victory                  # target\release\vict
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings   # CI checks both
 cargo test --workspace --locked                            # needs no game data; includes the policy check
+cargo test --workspace --all-features --locked -- --test-threads=1   # diagnostics tests, as CI runs them
 cargo test -p victory-shader --lib --locked <name> -- --test-threads=1   # one shader test
 cargo xtask policy                                         # asset-policy check by hand
 ```
@@ -106,7 +107,11 @@ See `docs/architecture.md` for the diagram. The data flow:
 - **Runtime switches are `VICTORY_*` environment variables, documented in a comment where each is
   read.** New speed work usually lands behind a switch, off by default or with `=0` restoring the
   old way, so it can be A/B'd. Debugging switches are compiled in only with the `diagnostics`
-  feature. Upstream's list of debugging switches is in `docs/README-fxceless.md`.
+  feature. Upstream's list of debugging switches is in `docs/README-fxceless.md`. In `victory-gpu`,
+  on/off switches go through `switch::on`, and diagnostics builds can flip switches mid-run with
+  `VICTORY_AB=<seconds>,<switch>,..` (`ab::pick`) to measure both sides in one scene. xtask's test
+  `documented_switches_are_read` fails if a Markdown file names a `VICTORY_*` switch that no Rust
+  file reads as a quoted literal of its whole name.
 - Code that approximates the console is marked `shortcut:`.
 - Commit messages are plain-language sentences describing the behaviour change and the switch that
   controls it; work taken from other forks names the source commit and author
