@@ -119,6 +119,92 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
     )
 }
 
+/// The formats of what a draw draws into, as the host has them: the eight
+/// render targets (0 where there is none), then depth (0 for none).
+pub(crate) type TargetFormats = [u32; 9];
+
+/// Whether a draw into views of the formats `bound` cannot go to the host
+/// with a pipeline that declares `declared`: a render target slot for which
+/// the pipeline declares a format has a view of another format bound. On the
+/// console the format is the view's, and the title draws so (fxceless run
+/// 289: a pipeline declaring R10G10B10A2_UNORM into an R11G11B10_FLOAT
+/// target, in a full-screen zoom and blur); on the host that draw is an
+/// invalid call. A slot nothing is bound to does not count; nor does a view
+/// in a slot the pipeline declares nothing for (nothing is written there,
+/// and a pipeline made to write there would leave the target undefined);
+/// nor the depth view (a depth texture's own format can be a typeless one
+/// no pipeline may declare).
+pub(crate) fn formats_differ(declared: &TargetFormats, bound: &TargetFormats) -> bool {
+    declared[..8].iter().zip(&bound[..8]).any(|(&d, &b)| d != 0 && b != 0 && b != d)
+}
+
+/// The formats a pipeline for a draw into `bound` declares
+/// ([`formats_differ`]): the title's own, but for the render target slots
+/// it declares a format for and a view of another format is bound to,
+/// which take the view's. The count of targets and the depth format stay
+/// the title's.
+pub(crate) fn formats_for(declared: &TargetFormats, bound: &TargetFormats) -> TargetFormats {
+    let mut formats = *declared;
+    for i in 0..8 {
+        if declared[i] != 0 && bound[i] != 0 {
+            formats[i] = bound[i];
+        }
+    }
+    formats
+}
+
+impl GraphicsState {
+    /// The formats the state declares ([`TargetFormats`]): nothing past its
+    /// count of render targets.
+    pub(crate) fn formats(&self) -> TargetFormats {
+        let mut formats = [0; 9];
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        for (to, from) in formats.iter_mut().zip(&self.targets.RTFormats[..n]) {
+            *to = from.0 as u32;
+        }
+        formats[8] = self.depth_format.0 as u32;
+        formats
+    }
+
+    /// The same state for a draw into views of the formats `bound`
+    /// ([`formats_for`]): those render target formats, everything else the
+    /// title's (blending is decided again for them when the host pipeline is
+    /// made, [`host_blend`]). Its [`GraphicsState::describe`] differs from
+    /// this state's (the formats are part of it), so its host pipeline has a
+    /// name of its own in the library.
+    pub(crate) fn with_formats(&self, bound: &TargetFormats) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs: Vec<D3D12_INPUT_ELEMENT_DESC> = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        let mut targets = self.targets;
+        let n = (targets.NumRenderTargets as usize).min(8);
+        for (to, &from) in targets.RTFormats[..n].iter_mut().zip(bound) {
+            *to = DXGI_FORMAT(from as i32);
+        }
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+}
+
 /// The title's blend state as the host takes it: blending off on integer
 /// render targets. The console ignores blending there, and titles leave it
 /// on (the world sets it on an `R8_UINT` target), but D3D12 does not allow

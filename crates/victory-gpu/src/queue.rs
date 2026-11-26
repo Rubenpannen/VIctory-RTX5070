@@ -38,9 +38,11 @@ struct Queue {
     kind: u32,
     desc: QueueDesc,
     /// What the queue was given after a wait for a fence that had not been
-    /// reached, in order; it runs when the fence gets there.
+    /// reached, in order; it runs when the fence gets there. Shared with
+    /// [`WAITING`], so a release of held work that runs while the title
+    /// frees the queue never reads freed memory.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    line: std::sync::Arc<Line>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -58,9 +60,52 @@ enum Held {
     Signal(usize, u64),
 }
 
-/// The queues that hold something (their addresses).
+/// What a queue holds back, kept apart from the queue so that it outlives
+/// it while [`release_held_now`] looks at it.
 #[cfg(windows)]
-static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+#[derive(Default)]
+struct Line {
+    held: std::sync::Mutex<Vec<Held>>,
+    /// The title freed the queue: what it still holds is left alone.
+    gone: AtomicBool,
+    /// The queue's address, for logs and captures only.
+    at: std::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: what a line holds (the host sides of the title's lists) was shared
+// between the title's threads and ours through the queue's address before;
+// the line only changes what keeps that memory alive, and every access is
+// under its mutex.
+#[cfg(windows)]
+unsafe impl Send for Line {}
+#[cfg(windows)]
+unsafe impl Sync for Line {}
+
+/// The lines of the queues that hold something. Each entry is a reference
+/// of its own: the queue was looked at through its address before, and a
+/// queue the title freed between the copy of this list and the look was read
+/// after it was freed (after Kelvaroq's patch 0021).
+#[cfg(windows)]
+static WAITING: std::sync::Mutex<Vec<std::sync::Arc<Line>>> = std::sync::Mutex::new(Vec::new());
+
+/// Puts the queue's line on [`WAITING`], once.
+#[cfg(windows)]
+fn waiting(this: This) {
+    let line = &queue(this).line;
+    line.at.store(this as usize, Ordering::Relaxed);
+    let mut waiting = lock(&WAITING);
+    if !waiting.iter().any(|l| std::sync::Arc::ptr_eq(l, line)) {
+        waiting.push(line.clone());
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Queue {
+    fn drop(&mut self) {
+        self.line.gone.store(true, Ordering::Release);
+        lock(&WAITING).retain(|l| !std::sync::Arc::ptr_eq(l, &self.line));
+    }
+}
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -134,7 +179,7 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if lock(&queue(this).held).is_empty() {
+    let first = if lock(&queue(this).line.held).is_empty() {
         lists
             .iter()
             .position(|&l| crate::list::cut_list(l))
@@ -190,16 +235,13 @@ fn submit_cut(this: This, lists: &[This]) {
             );
         }
         {
-            let mut held = lock(&queue(this).held);
+            let mut held = lock(&queue(this).line.held);
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
                 held.push(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        waiting(this);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -216,7 +258,7 @@ fn submit_split(this: This, lists: &[This]) {
     };
     let by = crate::list::waits_by_list(lists);
     // Behind what the queue already holds, nothing runs now.
-    let cut = if lock(&queue(this).held).is_empty() {
+    let cut = if lock(&queue(this).line.held).is_empty() {
         (0..lists.len())
             .find(|&i| by[i].iter().any(|w| !w.met()))
             .unwrap_or(lists.len())
@@ -277,11 +319,8 @@ fn submit_split(this: This, lists: &[This]) {
             pieces.push(Held::Run(taken, order));
             from = to;
         }
-        lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        lock(&queue(this).line.held).extend(pieces);
+        waiting(this);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -295,7 +334,7 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     if this.is_null() {
         return false;
     }
-    let mut held = lock(&queue(this).held);
+    let mut held = lock(&queue(this).line.held);
     if held.is_empty() {
         return false;
     }
@@ -325,11 +364,10 @@ pub(crate) fn release_held(all: bool) {
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
-        for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
-            loop {
+        for line in queues {
+            let q = line.at.load(Ordering::Relaxed);
+            let mut held = lock(&line.held);
+            while !line.gone.load(Ordering::Acquire) {
                 match held.first() {
                     None => break,
                     Some(&Held::Wait(fence, value))
@@ -422,8 +460,8 @@ pub(crate) fn release_held(all: bool) {
                 }
                 moved = true;
             }
-            if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+            if held.is_empty() || line.gone.load(Ordering::Acquire) {
+                lock(&WAITING).retain(|l| !std::sync::Arc::ptr_eq(l, &line));
             }
         }
         if !moved {
@@ -508,7 +546,7 @@ pub(crate) extern "system" fn create(
         kind: desc.kind,
         desc,
         #[cfg(windows)]
-        held: Default::default(),
+        line: Default::default(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -555,12 +593,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    let left = object::release_boxed::<Queue>(this);
-    #[cfg(windows)]
-    if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
-    }
-    left
+    object::release_boxed::<Queue>(this)
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
@@ -597,11 +630,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
-                lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                lock(&queue(this).line.held).extend(unmet.into_iter().map(Held::Value));
+                waiting(this);
             }
         }
         let kept = hold(this, || {
@@ -778,7 +808,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             return S_OK;
         }
         let behind = {
-            let mut held = lock(&queue(this).held);
+            let mut held = lock(&queue(this).line.held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
                 held.push(Held::Wait(fence as usize, value));
@@ -798,12 +828,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            waiting(this);
             // The fence may have got there meanwhile.
             release_held(false);
         }

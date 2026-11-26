@@ -311,7 +311,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // An upload from title memory earlier in the list can have used this
+    // view already (its first use), and then the copy from the card-written
+    // source was skipped: the shader read the uploaded bytes. Only a copy
+    // from the same source since satisfies this read (fxceless 19a45d1, its
+    // pull request #1241: zeros read back before, the packed light after).
+    list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -326,7 +332,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);

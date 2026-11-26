@@ -127,7 +127,12 @@ impl Made {
     }
 }
 
+/// Numbers host heaps one by one ([`HostHeap::id`]).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// [`NEXT_ID`]'s number for this heap ([`HostHeap::release`]).
+    id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1730,6 +1735,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2746,11 +2752,23 @@ impl HostHeap {
         stale
     }
 
+    /// This heap's identity ([`NEXT_ID`]): dynamic slots are given back
+    /// only to the heap that handed them out.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned) of the heap numbered `id`: a list whose title heap was
+    /// released, and another made at its address, holds slots of the old
+    /// heap, and must not free the new one's (fxceless e4245f3, its pull
+    /// request #589 by AscilCH).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -3492,6 +3510,76 @@ macro_rules! once {
     }};
 }
 
+/// The unsigned integer format with the layout of a 16-bit float or
+/// signed integer format (one, two or four channels), if `format` is one.
+pub(crate) fn half_format(format: u32) -> Option<u32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// `view` as a shader is shown it where it moves a buffer's 16-bit
+/// channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`): a buffer view in a
+/// 16-bit float or signed format, in the unsigned format of the same
+/// layout, through which every 16-bit pattern is read and stored as it
+/// is. `None` for every other view: the title's own serves (an unsigned
+/// one already carries the bits; a texture can only be viewed in the
+/// formats it was made for).
+pub(crate) fn half_view(view: &View) -> Option<View> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Shader(*resource, Some(desc)))
+        }
+        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Unordered(*resource, *counter, Some(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Placed(*unordered, *resource, desc))
+        }
+        _ => None,
+    }
+}
+
+/// The format of `view`, a buffer view through which a shader moves
+/// 16-bit channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`), if those integers
+/// are not what the console gives: a format of wider channels, a
+/// normalised one or a signed 8-bit one, whose values the console converts
+/// to and from halves. `None` for the formats the integers serve exactly
+/// (16 bits a channel of any kind, through [`half_view`] where needed, and
+/// unsigned channels of fewer bits; the title's are 16-bit unsigned) and
+/// for any other view.
+pub(crate) fn half_inexact(view: &View) -> Option<u32> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    // R16G16B16A16, R16G16 and R16 (float, unsigned, signed), then
+    // R10G10B10A2, R8G8B8A8, R8G8 and R8 unsigned.
+    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
+    let format = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => {
+            desc[0]
+        }
+        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
+        _ => return None,
+    };
+    (!EXACT.contains(&format)).then_some(format)
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -3846,6 +3934,7 @@ fn buffer_srv(
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     let width = shadow.width();
+    desc.Format = bit_exact_format(desc.Format);
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -3894,6 +3983,24 @@ fn buffer_srv(
         }
     }
     Some(Some(shadow.buffer.clone()))
+}
+
+/// The format a typed buffer view of `format` is made in on the host: a
+/// 32-bit integer format becomes the float format of the same width. The
+/// translated shaders read and write typed buffers as floats (a float
+/// handle), and through an integer view a driver may convert the numbers
+/// instead of passing the bits; through a float view of the same width the
+/// bits go as they are (fxceless f6a09d3, its pull request #684: the
+/// meshlet-culling lists). Buffer atomics use raw or structured views, which
+/// this leaves alone; every other format is the title's.
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -3973,6 +4080,7 @@ fn buffer_uav(
     }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    desc.Format = bit_exact_format(desc.Format);
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -4942,6 +5050,111 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// Typed buffer views of 32-bit integer formats are made in the float
+    /// format of the same width (the shaders' float loads and stores then
+    /// move the bits); every other format is the title's.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(
+                crate::resource::element(title.0 as u32),
+                crate::resource::element(host.0 as u32)
+            );
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
+    }
+
+    /// The unsigned twin of a 16-bit float or signed format has its layout,
+    /// and only buffer views in such a format are shown as another view.
+    #[test]
+    fn only_16_bit_float_and_signed_buffer_views_get_an_unsigned_twin() {
+        for (format, unsigned) in [(10, 12), (14, 12), (34, 36), (38, 36), (54, 57), (59, 57)] {
+            assert_eq!(half_format(format), Some(unsigned));
+            assert_eq!(
+                crate::resource::element(format),
+                crate::resource::element(unsigned),
+                "format {format}"
+            );
+        }
+        // The unsigned formats themselves, normalised 16-bit formats, and
+        // wider and narrower ones.
+        for other in [0, 12, 36, 57, 11, 13, 35, 37, 56, 58, 42, 17, 30, 61] {
+            assert_eq!(half_format(other), None, "format {other}");
+        }
+        const BUFFER: u32 = 1;
+        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
+        // R16G16B16A16_FLOAT: a buffer of halves a program moves as they are.
+        assert_eq!(
+            half_view(&View::Unordered(7, 0, Some(words(10, BUFFER)))),
+            Some(View::Unordered(7, 0, Some(words(12, BUFFER))))
+        );
+        assert_eq!(
+            half_view(&View::Shader(7, Some(words(54, BUFFER)))),
+            Some(View::Shader(7, Some(words(57, BUFFER))))
+        );
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&words(38, BUFFER));
+        placed[10] = 0x1234_0000;
+        let mut twin = placed;
+        twin[0] = 36;
+        let memory = [BUFFER, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        assert_eq!(
+            half_view(&View::Placed(true, memory, placed)),
+            Some(View::Placed(true, memory, twin))
+        );
+        // The title's kind (R16G16B16A16_UINT and R16_UINT buffers), a
+        // texture view (dimension 4: 2D), a view without a description, a
+        // constant buffer: the title's own.
+        assert_eq!(
+            half_view(&View::Unordered(7, 0, Some(words(12, BUFFER)))),
+            None
+        );
+        assert_eq!(half_view(&View::Shader(7, Some(words(57, BUFFER)))), None);
+        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(10, 4)))), None);
+        assert_eq!(half_view(&View::Shader(7, None)), None);
+        assert_eq!(half_view(&View::Constant(0x1000, 256)), None);
+    }
+
+    /// The buffer views through which the integers a shader moves halves
+    /// as are not what the console gives are named; the title's are not.
+    #[test]
+    fn views_whose_values_the_console_would_convert_are_named() {
+        const BUFFER: u32 = 1;
+        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
+        for exact in [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62] {
+            let view = View::Unordered(7, 0, Some(words(exact, BUFFER)));
+            assert_eq!(half_inexact(&view), None, "format {exact}");
+        }
+        // R32_FLOAT, R32_UINT, R16G16B16A16_UNORM, R8G8B8A8_UNORM, R8_SINT,
+        // and a structured or raw view (no format).
+        for inexact in [41, 42, 11, 28, 64, 0] {
+            let view = View::Shader(7, Some(words(inexact, BUFFER)));
+            assert_eq!(half_inexact(&view), Some(inexact));
+        }
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&words(41, BUFFER));
+        let memory = [BUFFER, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        assert_eq!(half_inexact(&View::Placed(true, memory, placed)), Some(41));
+        // Not a buffer view.
+        assert_eq!(half_inexact(&View::Shader(7, Some(words(41, 4)))), None);
+        assert_eq!(half_inexact(&View::Constant(0x1000, 256)), None);
+    }
+
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
     /// `victory-shader` never reads past smaller title sampler heaps.
@@ -5888,7 +6101,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
@@ -5906,17 +6119,17 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 }

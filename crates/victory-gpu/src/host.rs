@@ -2515,6 +2515,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The last card-written source copied into each aliased host texture
+    /// in this list ([`HostList::alias_source_changed`]).
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2843,7 +2846,7 @@ mod relay_tests {
             assert_eq!(views.dynamic(capacity), Some(first), "the list is still held but its slots are reusable");
             drop(items);
             assert_eq!(views.dynamic(1), None, "dropping the old list must leave the new allocation alone");
-            views.release(first, capacity);
+            views.release(views.id(), first, capacity);
             eprintln!("completed fence released {capacity} dynamic descriptor slots before list recycle");
         });
     }
@@ -7718,6 +7721,15 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether `source` is not the last texture copied into the aliased
+    /// host texture `view` in this list (`crate::texture::alias`); it is
+    /// from now on.
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Whether `key` was asked about ([`HostList::first_use`]) since the

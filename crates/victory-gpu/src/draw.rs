@@ -412,6 +412,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The formats of the views [`State::set_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -446,7 +450,7 @@ pub(crate) struct State {
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -475,14 +479,14 @@ impl State {
         count: u32,
     ) -> Option<u32> {
         let first = host.dynamic(count)?;
-        self.dynamic.push((std::ptr::from_ref(heap) as usize, first, count));
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, host.id(), first, count));
         Some(first)
     }
 
     /// Release the GPU's descriptor slots while keeping the list's other state alive.
     pub(crate) fn release_dynamic_slots(&mut self) {
-        for (heap, first, count) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, count);
+        for (heap, id, first, count) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, count);
         }
     }
 
@@ -1158,6 +1162,8 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
         for &h in handles.iter().take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize) {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1177,6 +1183,9 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
+                    if views.len() < 8 {
+                        formats[views.len()] = desc.Format.0 as u32;
+                    }
                     views.push((None, Some(desc)));
                     keys.push((0, record.key()));
                 }
@@ -1185,7 +1194,11 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            views.push((Some(texture), record.desc()));
+            let desc = record.desc();
+            if views.len() < 8 {
+                formats[views.len()] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            }
+            views.push((Some(texture), desc));
             keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
@@ -1193,7 +1206,9 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            let desc = record.depth_desc();
+            self.depth_state = depth_state(texture, desc.as_ref());
+            formats[8] = bound_format(texture, desc.as_ref().map(|d| d.Format));
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -1201,6 +1216,7 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        self.target_formats = formats;
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1483,7 +1499,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1669,7 +1685,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, &t.host.half_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3461,14 +3477,42 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats (fxceless
+    /// 58de9bf, its pull request #927).
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
+        // Whether the shader moves halves through descriptor `k` of the table
+        // in root parameter `slot`.
+        let is_half = |slot: u8, k: u32| half.contains(&(slot, k * 8));
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         for group in &plan.groups {
             let slot = group.slot;
             let needs_snapshot = group.has_cbv
@@ -3522,6 +3566,11 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first).
+            selected.extend(half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at / 8));
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
@@ -3539,6 +3588,11 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    if is_half(slot, k) {
+                        h.add([u32::MAX, k, 0x4841_4C46]);
+                    }
                 }
                 (table, n, h.0)
             };
@@ -3626,6 +3680,7 @@ impl State {
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
+                    && !is_half(slot, k)
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
@@ -3683,7 +3738,12 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        // Where the shader moves halves: the unsigned twin
+                        // of a 16-bit float or signed buffer view.
+                        match is_half(slot, k).then(|| crate::descriptor::host::half_view(&view)).flatten() {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -4357,6 +4417,17 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
 /// the write state.
 /// shortcut: whole textures have one state, so a view that writes one of
 /// two planes counts as writing.
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) -> u32 {
     // D16_UNORM and D32_FLOAT: depth formats without a stencil plane.
     const ONE_PLANE: [i32; 2] = [55, 40];

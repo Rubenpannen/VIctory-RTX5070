@@ -209,6 +209,7 @@ fn wave_ticket_counters_cover_every_id_on_wave32_hardware() {
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         run_counters(
             &host,
@@ -271,6 +272,7 @@ fn wave_ticket_prologue_runs_full_and_partial_waves_on_warp() {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         run_counters(&host, &cs, shape.into_iter().product(), wave, "WARP", shape);
     }

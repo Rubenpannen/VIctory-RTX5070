@@ -213,7 +213,11 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // As far as it goes, like the older versions below: an
+            // unfinished version is never read.
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -230,8 +234,17 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let Some((name, display, blobs)) = load(&version)? else {
             continue;
         };
+        // Older versions are removed as far as that goes. The newest that
+        // reads is the container whatever is left below it, and a file
+        // another program holds without letting it be deleted (a virus
+        // scanner, a backup in progress) fails the removal: returning that
+        // error made the container unreadable and every save of it fail
+        // for as long as the file was held (fxceless 6a42ed2).
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let path = dir.join(format!("v{old}"));
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::info!(dir = %path.display(), %e, "an older save version stays for now; it goes at a later save");
+            }
         }
         return Ok(Some(Version {
             dir: version,
