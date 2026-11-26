@@ -9539,6 +9539,15 @@ impl Meter {
                          hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                     );
                 }
+                let [made, volatile] =
+                    [0, 1].map(|i| crate::texture::VOLATILE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if made + volatile > 0.0 {
+                    tracing::info!(
+                        "textures the title writes between a list's recording and its submission, per frame \
+                         (VICTORY_TEXTURE_VOLATILE=0: uploaded a list late): {made:.2} made volatile, {volatile:.1} uploads \
+                         recorded because a texture was"
+                    );
+                }
                 let [through, left, filled, short] =
                     [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if through + left + filled > 0.0 {

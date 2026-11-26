@@ -93,6 +93,46 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// A list recorded a use of it without an upload (it was not dirty)
+    /// since the last detiling ([`volatile_uploads`]).
+    skipped: std::sync::atomic::AtomicBool,
+    /// The frame a detiling last followed such a use (0: none), and the frame
+    /// until which every list that samples it uploads it.
+    stale_at: std::sync::atomic::AtomicU64,
+    volatile_until: std::sync::atomic::AtomicU64,
+}
+
+/// Frames a texture stays volatile ([`volatile_uploads`]) after its last
+/// change, and the most between two changes after uses without an upload
+/// that make it so.
+const VOLATILE_FRAMES: u64 = 30;
+
+/// Since the last frame-rate line: textures made volatile, and uploads
+/// recorded only because a texture was ([`volatile_uploads`]).
+pub(crate) static VOLATILE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a texture the title writes again and again between a list's
+/// recording and its submission is uploaded by every list that samples it
+/// for a while (`VICTORY_TEXTURE_VOLATILE=0`: only by lists recorded after
+/// the check at a submission found it changed, as before).
+///
+/// A list records a texture's upload only if its staging buffer changed since
+/// the last upload; the check that finds a change runs at submission, so the
+/// list being submitted shows the texture as it was and the next list that
+/// samples it uploads the change. With the refreshes in front of a
+/// submission's steps that next list uploaded only every other time: its
+/// check of the new contents comes before its own upload's step, which then
+/// notes the staging buffer as uploaded, the change and all, and the list
+/// after it records no upload. The title's intro video draws its planes from
+/// a ring of three sets it writes on the processor just before it submits:
+/// three new pictures were shown, then the same three again (A B C A B C D E
+/// F D E F; 75 of 151 presented frames went back in time, at a steady 30 a
+/// second). A texture becomes volatile when a check finds it changed after a
+/// use without an upload twice within [`VOLATILE_FRAMES`]; it stays so while
+/// it keeps changing.
+fn volatile_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_VOLATILE").is_none_or(|v| v != "0"))
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -794,13 +834,20 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
-    // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    // frame was recorded before that check). A texture the title keeps
+    // writing between the recording and the submission is uploaded by every
+    // list for a while ([`volatile_uploads`]).
+    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) && !staging.volatile() {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+        staging.skipped.store(true, Relaxed);
         list.defer_texture(staging);
         return;
     }
+    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+        VOLATILE[1].fetch_add(1, Relaxed);
+    }
+    staging.skipped.store(false, Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     if no_wait() && fill_unlocked() {
@@ -1138,6 +1185,34 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// Whether every list that samples it uploads it ([`volatile_uploads`]).
+    fn volatile(&self) -> bool {
+        volatile_uploads()
+            && crate::frame::current() < self.volatile_until.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The staging buffer is detiled anew: a texture already volatile stays
+    /// so; one that a list used without an upload since the last detiling
+    /// becomes so if that happened before, not long ago ([`volatile_uploads`]).
+    fn changed(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let skipped = self.skipped.swap(false, Relaxed);
+        if !volatile_uploads() {
+            return;
+        }
+        let frame = crate::frame::current();
+        let until = frame + VOLATILE_FRAMES;
+        if frame < self.volatile_until.load(Relaxed) {
+            self.volatile_until.store(until, Relaxed);
+        } else if skipped {
+            let last = self.stale_at.swap(frame.max(1), Relaxed);
+            if last != 0 && frame <= last + VOLATILE_FRAMES {
+                self.volatile_until.store(until, Relaxed);
+                VOLATILE[0].fetch_add(1, Relaxed);
+            }
+        }
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
@@ -1497,6 +1572,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.changed();
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1948,6 +2024,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        skipped: std::sync::atomic::AtomicBool::new(false),
+        stale_at: std::sync::atomic::AtomicU64::new(0),
+        volatile_until: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
