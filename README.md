@@ -72,6 +72,8 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 `-Display` sets the display mode the title is told it is plugged into: `monitor`
 (the default, this PC's main screen), `console` (3840x2160) or `WxH`.
+`-Log` also writes the whole log to `<data_dir>\logs\play-<date>-<time>.log`
+(`-LogFile <path>` elsewhere, outside this folder: it holds the title's data).
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

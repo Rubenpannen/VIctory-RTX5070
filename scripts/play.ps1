@@ -6,6 +6,9 @@
 # -Display      the display mode the title is told it is plugged into: 'monitor' (the default, this
 #               PC's main screen, e.g. 2560x1440), 'console' (3840x2160, as before) or WxH
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Log          also write the whole log to <data_dir>\logs\play-<date>-<time>.log (data_dir from
+#               victory.toml or VICTORY_DATA_DIR); -LogFile <path> writes it there instead. The log
+#               holds the title's data, so it may not be inside this repository (docs/asset-policy.md).
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -13,7 +16,9 @@ param(
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidatePattern('^(monitor|console|\d{3,4}[xX]\d{3,4})$')][string]$Display = 'monitor',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [switch]$Log,
+    [string]$LogFile = ''
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -45,5 +50,47 @@ $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DAT
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
-Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
+if ($Log -and -not $LogFile) {
+    $data = $env:VICTORY_DATA_DIR
+    $toml = Join-Path $root 'victory.toml'
+    if (-not $data -and (Test-Path $toml)) {
+        $line = Select-String -Path $toml -Pattern '^\s*data_dir\s*=\s*[''"](.+)[''"]' | Select-Object -First 1
+        if ($line) { $data = $line.Matches[0].Groups[1].Value }
+    }
+    if (-not $data) { Write-Host "No data_dir in victory.toml or VICTORY_DATA_DIR: give -LogFile <path>."; return }
+    $LogFile = Join-Path $data "logs\play-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+}
+$writer = $null
+if ($LogFile) {
+    $LogFile = [System.IO.Path]::GetFullPath($LogFile)
+    if ($LogFile.StartsWith($root.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "The log holds the title's data: write it outside this repository, not $LogFile."
+        return
+    }
+    New-Item -ItemType Directory -Force (Split-Path $LogFile) | Out-Null
+    # UTF-8 without colour codes, flushed line by line so that a crash keeps all of it.
+    $writer = New-Object System.IO.StreamWriter($LogFile, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $writer.AutoFlush = $true
+    Write-Host "Log: $LogFile"
+}
+
+Push-Location $root   # victory.toml is looked for here
+try {
+    if ($writer) {
+        # The log comes on the error stream: each line as text, so that PowerShell does not show
+        # it as errors (red, NativeCommandError).
+        $ErrorActionPreference = 'Continue'
+        & $victory run $Exe --execute 2>&1 | ForEach-Object {
+            $text = "$_"
+            $writer.WriteLine(($text -replace "$([char]27)\[[0-9;]*m", ''))
+            $text
+        }
+    } else {
+        & $victory run $Exe --execute
+    }
+} finally {
+    if ($writer) { $writer.Dispose() }
+    Pop-Location
+}
