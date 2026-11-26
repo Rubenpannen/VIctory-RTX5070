@@ -1436,7 +1436,9 @@ fn split_group_base() -> bool {
     if let Some(enabled) = TEST_GROUP_BASE.get() {
         return enabled;
     }
-    std::env::var_os("VICTORY_DISPATCH_SPLIT").is_some_and(|v| v == "1")
+    // (Read once: this is asked for every shader looked up in the cache.)
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_SPLIT").is_some_and(|v| v == "1"))
 }
 
 #[cfg(test)]
