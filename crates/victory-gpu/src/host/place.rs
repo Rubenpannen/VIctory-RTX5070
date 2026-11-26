@@ -33,7 +33,9 @@
 //!
 //! Copies to memory that has no host copy yet are done as before: nothing on
 //! the card has read or written it. So are those of more than 8 MiB out of
-//! memory shaders do not write (streaming).
+//! memory shaders do not write (streaming) into a host copy with two sides,
+//! whose card side takes them in the submission's order anyway; into one with
+//! one side they are placed too.
 
 use super::*;
 use crate::shadow::Shadow;
@@ -207,7 +209,13 @@ impl HostList {
         let own = shaders_own(src, len);
         let scratch = match &own {
             Some(_) => None,
-            None if len <= MOST => match self.scratch_at(len as u64) {
+            // Above `MOST` too where the destination's host copy has one side
+            // (in the PC's memory, what the card reads): done at submission,
+            // the copy would change it under the submissions in the air that
+            // still read it. On cards with a budget of 12 GiB or less copies
+            // under 16 MiB have one side (`shadow::card_limits`), so streaming
+            // copies of 8 to 16 MiB came here.
+            None if len <= MOST || !to.carded() => match self.scratch_at(len as u64) {
                 Some(scratch) => Some(scratch),
                 None => return false,
             },

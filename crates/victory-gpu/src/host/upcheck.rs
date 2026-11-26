@@ -671,7 +671,11 @@ mod tests {
     /// `VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_UPCOPY_CHECK=1 cargo
     /// test -p victory-gpu --lib upcheck -- --ignored --test-threads=1
     /// <name>`.
-    const LEN: usize = 4 << 20;
+    ///
+    /// The copies of `LEN` are to be in the card's memory on any card: the
+    /// least size of those is 16 MiB on budgets of 12 GiB or less
+    /// (`shadow::card_limits`), less on larger ones.
+    const LEN: usize = 16 << 20;
 
     /// Title memory of our own (write-watched, or a view of a section, which
     /// is guarded), and the card copy of the title buffer it is.
@@ -752,7 +756,7 @@ mod tests {
     /// what it found. Without `VICTORY_FETCH_CHECK` title memory keeps what
     /// was in between, and the next refresh of the 64 KiB sends it up.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_FETCH_CHECK=1 and a process of its own"]
     fn a_result_caught_in_between_is_put_right() {
         let Some(host) = host() else {
             return;
@@ -837,7 +841,7 @@ mod tests {
     /// A shader that writes through views it picks: its buffer is found when
     /// it comes to it in turn, and what it writes from then on is landed.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_PICKED_WRITES=1 VICTORY_PICKED_MB=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_PICKED_WRITES=2 VICTORY_PICKED_MB=1 and a process of its own"]
     fn writes_through_picked_views_come_back() {
         let Some(host) = host() else {
             return;
@@ -882,17 +886,30 @@ mod tests {
     /// The title copies another value to the same bytes in each of three
     /// submissions, and each has a draw (a copy here) that reads them. The
     /// card is busy meanwhile, so all three are prepared before the first
-    /// runs: each must read its own.
-    fn each_reads_its_own(len: usize, resource: usize, carded: bool) {
+    /// runs: each must read its own (its first and its last 256 bytes are
+    /// looked at).
+    ///
+    /// `n` bytes are copied into a copy of `len`, out of title memory that has
+    /// no host copy (as streaming does). `placed`: as `list.rs` does a title's
+    /// buffer copy, at its place in the list where `place_copy` takes it, else
+    /// at submission; otherwise always at submission (`defer_copy`).
+    fn each_reads_its_own(len: usize, n: usize, resource: usize, carded: bool, placed: bool) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let Some(host) = host() else {
             return;
         };
-        let (title, start, shadow) = title_of(resource, true, len);
+        const AT: usize = 8192;
+        assert!(n >= 256 && AT + n <= len);
+        let (_, start, shadow) = title_of(resource, true, len);
         assert_eq!(shadow.carded(), carded, "where the copy is");
+        // SAFETY: memory of our own, never freed.
+        let source = unsafe { VirtualAlloc(std::ptr::null(), 3 * n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!source.is_null());
+        // SAFETY: `3 * n` bytes just committed.
+        let source = unsafe { std::slice::from_raw_parts_mut(source, 3 * n) };
         let slow = Slow::new(host);
         let (out, out_data) = host.shared_buffer(1 << 16).unwrap();
         let mut lists = Vec::new();
-        const AT: usize = 8192;
         // All there once.
         let all = host.new_list().unwrap();
         shadow.refresh(&all, start as u64, len as u64);
@@ -903,7 +920,7 @@ mod tests {
         let mut wrong = Vec::new();
         for round in 0..6u8 {
             for v in 0..3u8 {
-                title[65_536 + usize::from(v) * 256..][..256].fill(round * 16 + v + 1);
+                source[usize::from(v) * n..][..n].fill(round * 16 + v + 1);
             }
             let busy = host.new_list().unwrap();
             slow.record(&busy, 40);
@@ -912,11 +929,15 @@ mod tests {
             lists.push(busy);
             for v in 0..3usize {
                 let list = host.new_list().unwrap();
-                list.defer_copy((start + AT) as *mut u8, (start + 65_536 + v * 256) as *const u8, 256);
-                shadow.refresh(&list, (start + AT) as u64, 256);
+                let (to, from) = (start + AT, source.as_ptr() as usize + v * n);
+                if !(placed && list.place_copy(to, from, n)) {
+                    list.defer_copy(to as *mut u8, from as *const u8, n);
+                    shadow.refresh(&list, to as u64, n as u64);
+                }
                 // SAFETY: an open list; live buffers.
                 unsafe {
                     list.list.CopyBufferRegion(&out, (v * 256) as u64, &shadow.buffer, AT as u64, 256);
+                    list.list.CopyBufferRegion(&out, (768 + v * 256) as u64, &shadow.buffer, (AT + n - 256) as u64, 256);
                 }
                 list.close();
                 host.execute_own(&list);
@@ -924,11 +945,12 @@ mod tests {
             }
             settle_now(WHY_SYNC);
             // SAFETY: a mapping of 64 KiB; the copies into it have run.
-            let read = unsafe { std::slice::from_raw_parts(out_data, 768) };
+            let read = unsafe { std::slice::from_raw_parts(out_data, 1536) };
             for v in 0..3u8 {
-                let got = read[usize::from(v) * 256];
-                if got != round * 16 + v + 1 {
-                    wrong.push((round, v, got - round * 16));
+                for got in [read[usize::from(v) * 256], read[768 + usize::from(v) * 256 + 255]] {
+                    if got != round * 16 + v + 1 {
+                        wrong.push((round, v, got.wrapping_sub(round * 16)));
+                    }
                 }
             }
         }
@@ -942,16 +964,31 @@ mod tests {
         assert_eq!(host.log_messages(), None);
     }
 
+    /// At submission into a copy with two sides: what goes up to the card side
+    /// is the submission's own (`crate::host::send`).
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_on_the_card() {
-        each_reads_its_own(LEN, 0x7777, true);
+        each_reads_its_own(LEN, 256, 0x7777, true, false);
     }
 
+    /// A copy with one side is what the card reads: the title's copies into
+    /// it are done at their place in the list. (Done at submission they change
+    /// it under the submissions in the air: every one of them read the last
+    /// one's value, unless `VICTORY_CARD_ALL=1` gives it two sides.)
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_in_pc_memory() {
-        each_reads_its_own(256 << 10, 0x8888, std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"));
+        each_reads_its_own(256 << 10, 256, 0x8888, std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"), true);
+    }
+
+    /// The same for a streaming copy of more than 8 MiB into a copy with one
+    /// side, which was done at submission (`place::MOST`): on cards with a
+    /// budget of 12 GiB or less every copy under 16 MiB has one side.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_MB=64 and a process of its own"]
+    fn a_big_copy_into_pc_memory_is_read_in_order() {
+        each_reads_its_own(12 << 20, 9 << 20, 0x8899, false, true);
     }
 
     /// What a draw of `list` reads at `at`: comes to `out`.
