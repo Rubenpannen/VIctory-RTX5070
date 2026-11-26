@@ -3,6 +3,8 @@
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
+# -Display      the display mode the title is told it is plugged into: 'monitor' (the default, this
+#               PC's main screen, e.g. 2560x1440), 'console' (3840x2160, as before) or WxH
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -10,6 +12,7 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidatePattern('^(monitor|console|\d{3,4}[xX]\d{3,4})$')][string]$Display = 'monitor',
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -24,6 +27,14 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($Display -eq 'monitor') {
+    # In real pixels (unlike Windows.Forms, which a window without DPI awareness gets scaled).
+    $screen = Get-CimInstance Win32_VideoController | Where-Object CurrentHorizontalResolution | Select-Object -First 1
+    if ($screen) { $settings.VICTORY_DISPLAY_MODE = "$($screen.CurrentHorizontalResolution)x$($screen.CurrentVerticalResolution)" }
+} elseif ($Display -ne 'console') {
+    $settings.VICTORY_DISPLAY_MODE = $Display
+}
+if ($settings.VICTORY_DISPLAY_MODE) { Write-Host "Display mode told to the title: $($settings.VICTORY_DISPLAY_MODE)" }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
