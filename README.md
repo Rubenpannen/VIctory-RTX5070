@@ -4,7 +4,7 @@ A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), itse
 fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that
 runs an Xbox Series title natively on Windows from files the user supplies.
 This one is about **speed on NVIDIA Blackwell, the GeForce RTX 5070**: the world
-at a playable frame rate on a 12 GB card in a 32 GB PC, without giving up the
+at a playable frame rate on a 12 GB card, without giving up the
 picture. It is not there yet.
 
 **This repository contains no game files, code or assets.** You need your own
@@ -13,7 +13,7 @@ or publisher.
 
 ## The target machine
 
-Windows 11, AMD Ryzen 9 5900X (12 cores, 24 threads), 32 GB RAM, GeForce RTX 5070
+Windows 11, AMD Ryzen 9 5900X (12 cores, 24 threads), 64 GB RAM, GeForce RTX 5070
 12 GB. No measurements of this fork on it yet; the figures below are those of the
 fork it started from.
 
@@ -23,7 +23,7 @@ has to plan around:
 | | Parent fork (RX 7900 XTX) | This fork (RTX 5070) |
 |---|---|---|
 | GPU memory | 24 GB | **12 GB**: half the room for texture copies, render targets and card copies of title buffers |
-| System memory | 64 GB | **32 GB**, where the parent measured 40-46 GB of private memory |
+| System memory | 64 GB | 64 GB (32 GB until 2026-11-26), room for the 35-46 GB of private memory the parent measured |
 | Waves | AMD RDNA 3, wave32 and wave64 | NVIDIA, 32 lanes only: programs written for 64-lane waves are emulated |
 | CPU | i9-12900K, 8 fast and 8 slow cores | Ryzen 9 5900X, 12 equal cores over two dies |
 | Driver | AMD | NVIDIA: its own pipeline creation times and shader cache |
