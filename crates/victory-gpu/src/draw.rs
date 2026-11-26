@@ -118,6 +118,24 @@ fn recheck_soon() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_none_or(|v| v != "0"))
 }
 
+/// Looks one frame apart that a texture found changed with nothing to tell
+/// of it gets after its upload, before its looks space out again
+/// ([`RECHECK_FRAMES`]); each change found starts the count anew. A texture
+/// the title repaints every few frames was looked at one frame after its
+/// upload, found as it was, and next twelve frames on: it showed each new
+/// picture up to eleven frames late, and moved in jumps. A look reads 48 KiB
+/// at most. `VICTORY_RECHECK_LIVELY=<n>` (at most 255): that many; `0`: none,
+/// as before. Default 120.
+fn recheck_lively() -> u8 {
+    static LOOKS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LOOKS.get_or_init(|| {
+        std::env::var("VICTORY_RECHECK_LIVELY")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(120, |n| n.min(255) as u8)
+    })
+}
+
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
 /// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
@@ -2284,14 +2302,28 @@ impl State {
             // title paints all the time through another view of their pages
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
+            // And after such a finding, it is looked at every frame for a
+            // while (`recheck_lively`).
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            let mut lively = 0;
+            if let Some((at, len, print, looks, uploaded, still)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if still > 0 {
+                        host.texture_slot_recheck(index, write, frame + 1, (at, len), print, looks, uploaded, still - 1);
+                        continue;
+                    }
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + wait,
+                            (at, len),
+                            print,
+                            looks + 1,
+                            uploaded,
+                            0,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
@@ -2299,6 +2331,7 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                lively = recheck_lively();
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2465,7 +2498,7 @@ impl State {
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, lively);
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -2576,7 +2609,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, lively);
                 }
                 None => host.texture_slot_done(index, write, again),
             }

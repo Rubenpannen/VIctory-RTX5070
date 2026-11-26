@@ -885,8 +885,10 @@ struct Waiting {
     /// For a slot uploaded whole and looked at again
     /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
     /// the fingerprint it had at the upload, how many looks found it
-    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
-    checked: (u64, u64, u64, u8, u64),
+    /// unchanged, the frame of the upload, and how many looks are still due
+    /// one frame apart because a look found it changed lately (`lively`,
+    /// `crate::draw`). A fingerprint of 0: none.
+    checked: (u64, u64, u64, u8, u64, u8),
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -913,7 +915,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0, 0) });
     }
 
     fn remove(&mut self, index: u32) {
@@ -1018,18 +1020,29 @@ impl TextureQueue {
     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
     /// with fingerprint `print`: looked at again from frame `due`, for a
     /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame).
+    /// `looks`-th such look; `uploaded` is the upload's frame; `lively`: the
+    /// looks still due one frame apart).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(
+        &mut self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        print: u64,
+        looks: u8,
+        uploaded: u64,
+        lively: u8,
+    ) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+            w.checked = (at.0, at.1, print, looks, uploaded, lively);
         }
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, u8)> {
         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
     }
 
@@ -1041,7 +1054,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0, 0) });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1752,13 +1765,14 @@ impl HostHeap {
         print: u64,
         looks: u8,
         uploaded: u64,
+        lively: u8,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, print, looks, uploaded, lively);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, u8)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
@@ -5112,6 +5126,25 @@ mod tests {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    /// A slot uploaded whole keeps what its look needs, the looks still due
+    /// one frame apart among it, until the title writes it again; the pass's
+    /// word about an older write changes nothing.
+    #[test]
+    fn a_rechecked_slot_keeps_its_lively_looks() {
+        let mut q = TextureQueue::default();
+        q.written(30, 1, 0, false);
+        let write = q.due(1, 100)[0].1;
+        q.recheck(30, write, 2, (0x1000, 0x8000), 77, 0, 1, 120);
+        assert_eq!(q.checked(30), Some((0x1000, 0x8000, 77, 0, 1, 120)));
+        assert!(!q.due(1, 100).iter().any(|d| d.0 == 30));
+        assert_eq!(q.due(2, 100)[0].0, 30);
+        q.recheck(30, write, 3, (0x1000, 0x8000), 77, 0, 1, 119);
+        assert_eq!(q.checked(30).map(|c| c.5), Some(119));
+        q.written(30, 3, 0, false);
+        q.recheck(30, write, 4, (0x1000, 0x8000), 77, 0, 1, 118);
+        assert_eq!(q.checked(30), None);
     }
 
     /// Textures of which only the smallest levels are held, packed into
