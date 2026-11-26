@@ -664,6 +664,27 @@ pub fn emit(
                 }
             }
         }
+        // Nothing else gave 32-lane waves, and a host of 32-lane waves refuses the pipeline of
+        // the 64-lane form (`WaveSize(64)`): the title's dispatches of it were dropped. Last of
+        // all, the per-lane branches taken wave-wide ([`widen`]) even with `VICTORY_WAVE_WIDE`
+        // unset: groups of one console wave whose shared memory is read and written where not
+        // every lane runs (counters set by one lane, then `ds_min`/`ds_max`/`ds_add` by the
+        // others, then read; no barrier, the console wave runs in step). Seven programs of
+        // the RTX 5070's runs on 2026-11-26 came here; four are groups of one console wave.
+        // No program that translated otherwise is touched (those of runs 121-124 among them).
+        // `VICTORY_WAVE_WIDE=0`: not, as before.
+        if !wide_on && wide_option.as_ref().is_none_or(|v| v != "0") {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)).map(|f| f.0) } else { None };
+            let bases = [deep.as_ref(), forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why, false);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the

@@ -585,6 +585,86 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
 }
 
+/// One console wave of 64 threads whose shared memory is a counter, as the title's
+/// particle-visibility and water-volumetrics programs keep theirs: lane 0 sets dword 0 of
+/// LDS to 0, then the threads below s0 take `ds_max_u32` of their index there and read it back,
+/// inside their branch and with no barrier (the console wave runs in step). Every thread that
+/// read stores it to dword 0 of the raw UAV. Per lane that needs 64-lane waves (an LDS read
+/// and write in one lane-branch region), which a host of 32-lane waves refuses; with the
+/// branches the lowering names taken wave-wide it is two host waves of 32, which meet before
+/// each LDS access (`emit`'s last resort, [`super::widen`]).
+#[test]
+fn an_lds_counter_inside_a_lane_branch_is_two_host_waves_with_the_branches_wave_wide() {
+    let words = [
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz past the write
+        0xD834_0000,
+        0x0000_0101, // ds_write_b32 v1, v1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0008, // s_cbranch_execz past the body
+        0xD820_0000,
+        0x0000_0001, // ds_max_u32 v1, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0200_0001, // ds_read_b32 v2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 2 << 8, // buffer_store_dword v2, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native(&words);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let wave_of = |wide: &HashSet<usize>| -> (Option<u32>, Vec<u8>) {
+        let st = structure::structure_wide(&p, wide).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = lower::lower_counted(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        }, false);
+        lower::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("lower");
+        (lowered.wave_size, lowered.dxil)
+    };
+    // per lane: 64-lane waves, and the lowering names the blocks the waves cannot meet in
+    lower::take_needs();
+    assert_eq!(wave_of(&HashSet::new()).0, Some(64));
+    let needs = lower::take_needs();
+    assert!(!needs.is_empty());
+    let st = structure::structure(&p).expect("structure");
+    let wide: HashSet<usize> = lower::branches_around(&st, &needs).expect("the branches around them").into_iter().collect();
+    // wave-wide: two host waves of 32
+    let (wave, mut dxil) = wave_of(&wide);
+    assert_eq!(wave, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut dxil).expect("DXIL validation failed");
+    }
+    let shader = lowered(&native, &p, &wide).expect("lower");
+    // On a GPU of 32-lane waves: the max of both halves, whichever half's threads take part.
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, expected) in [(64u32, 63u32), (40, 39), (33, 32), (32, 31), (10, 9), (1, 0)] {
+        let Some(got) = on_the_card(&shader, [below, 0]) else { return };
+        assert_eq!(got, expected, "{below} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: the max of both halves in every case");
+}
+
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
