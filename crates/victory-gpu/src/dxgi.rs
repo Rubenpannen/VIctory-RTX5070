@@ -229,23 +229,31 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// Series X on a 1080p set lists a 1080p mode), else the title's output size
+/// if `VICTORY_OUTPUT=WxH` patches it (victory-game's `resolution`), else
+/// 3840x2160. The title's settings leave its UI's size to the display
+/// (video `uiResolution` 0x0): with a 4K mode and a 1080p output its
+/// settings menu came out about twice too large, cut off at the right and
+/// bottom edges, while the pause menu fitted.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
+        let read = |name: &str| parse_size(&std::env::var(name).ok()?);
+        let size = read("VICTORY_DISPLAY_MODE")
+            .or_else(|| read("VICTORY_OUTPUT"))
+            .unwrap_or((3840, 2160));
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
+}
+
+/// `WxH` within the sizes a console lists.
+fn parse_size(spec: &str) -> Option<(u32, u32)> {
+    let (w, h) = spec.trim().split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    ((640..=7680).contains(&w) && (360..=4320).contains(&h)).then_some((w, h))
 }
 
 /// The console's mode list: one 4K mode at 60 Hz (the title looks
@@ -304,6 +312,14 @@ mod tests {
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+
+    #[test]
+    fn display_sizes_parse() {
+        assert_eq!(parse_size("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_size(" 2560X1440 "), Some((2560, 1440)));
+        assert_eq!(parse_size("320x200"), None);
+        assert_eq!(parse_size("1080p"), None);
+    }
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.

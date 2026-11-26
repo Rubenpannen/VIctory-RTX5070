@@ -16,7 +16,9 @@
 //!   size through the copy +0x5eb24f0 makes (+0x75e6fe0). The display mode
 //!   list it matches against is its own (+0x5a38910: 1280x720, 1664x936,
 //!   1920x1080, 2560x1440, 3840x2160 at 60 Hz, table +0x615c0c0), not the
-//!   DXGI output's, which is why `VICTORY_DISPLAY_MODE` changes nothing.
+//!   DXGI output's, which is why `VICTORY_DISPLAY_MODE` changes nothing
+//!   here. The UI does size itself by that mode, so victory-gpu reports the
+//!   size asked for here as the display mode too (`dxgi::display_size`).
 //!   Here that block becomes: write the size asked for into the settings
 //!   (+0x204/+0x208), then the title's own else-path (screen size set,
 //!   +0xd8c3a0 if the height changed). Everything that reads the settings
