@@ -668,6 +668,9 @@ name = "victory-game"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "tracing",
+ "victory-loader",
+ "windows-sys",
  "zlib-rs",
 ]
 

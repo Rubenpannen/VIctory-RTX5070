@@ -24,13 +24,15 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
-#[cfg(windows)]
-pub mod descriptor_sites;
-pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
-pub mod resolution;
 pub mod resolve;
+/// Code of ours placed near the title's (`victory-game`'s patches): a
+/// `jmp rel32` and memory within its reach.
+#[cfg(windows)]
+pub mod stubs {
+    pub use crate::console_insn::{STUBS_LEN, jump, near};
+}
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]

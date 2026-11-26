@@ -172,7 +172,7 @@ pub fn run(
     // descriptor records tell the layer their slots.
     #[cfg(windows)]
     if execute && victory_hle::port_descriptors::on() {
-        use victory_loader::descriptor_sites::{Hooked, SITES, apply};
+        use victory_game::descriptor_sites::{Hooked, SITES, apply};
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, nothing of it has run yet, and the
         // marks are a static.
@@ -186,8 +186,8 @@ pub fn run(
     // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
     // overrides it; `off` leaves the title alone).
     #[cfg(windows)]
-    if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
-        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+    if execute && let Some(ms) = victory_game::frame_rate::asked_interval_ms() {
+        use victory_game::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
         let asked = std::env::var("VICTORY_TITLE_FPS").ok();
         match title_rate(ms, asked.as_deref()) {
             Some(rate) => {
@@ -210,7 +210,7 @@ pub fn run(
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_game::resolution::apply_asked(image.base(), size) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -301,12 +301,12 @@ fn watch(base: usize, size: usize) {
 }
 
 /// Debugging aid: `VICTORY_TIMER_LOG=1` logs the title's timers once a
-/// second (`victory_loader::frame_rate`): its frame time and limiter flag,
+/// second (`victory_game::frame_rate`): its frame time and limiter flag,
 /// and each timer's two times, step in seconds and in milliseconds. Whether
 /// game time keeps to the wall clock at any frame rate is read from these.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn timers(base: usize, size: usize) {
-    use victory_loader::frame_rate::{FRAME_US, LIMITER_ON, TIMERS};
+    use victory_game::frame_rate::{FRAME_US, LIMITER_ON, TIMERS};
     if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
         return;
     }

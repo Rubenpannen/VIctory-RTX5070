@@ -10,6 +10,16 @@ publish.workspace = true
 [dependencies]
 memchr.workspace = true
 zlib-rs.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The patches of the title's code place their stubs with the loader's helpers.
+victory-loader.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true

@@ -44,7 +44,7 @@ pub fn on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// What the patched stores read (`victory_loader::descriptor_sites`,
+/// What the patched stores read (`victory_game::descriptor_sites`,
 /// `MARKS_LEN` bytes): the heap's first byte, its length (0: none), the map
 /// of slots, the map of chunks of [`CHUNK`] slots.
 #[repr(C)]
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Marks, chunks), 24);
     }
 
-    /// `victory_loader::descriptor_sites::MARKS_LEN` (no dependency on the loader).
+    /// `victory_game::descriptor_sites::MARKS_LEN` (no dependency on that crate).
     fn victory_loader_marks_len() -> usize {
         32
     }

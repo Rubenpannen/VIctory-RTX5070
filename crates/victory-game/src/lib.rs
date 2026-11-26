@@ -3,6 +3,13 @@
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
 
+// Patches of the title's code, applied at load before it runs. They hold the
+// bytes of each place they change, compared before patching (allowed by the
+// project owner's decision of 2026-11-26, docs/asset-policy.md).
+#[cfg(windows)]
+pub mod descriptor_sites;
+pub mod frame_rate;
+pub mod resolution;
 pub mod sgd5;
 
 /// A specific build of the title executable we know how to run.
