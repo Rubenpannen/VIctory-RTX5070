@@ -38,12 +38,31 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
+/// `VICTORY_POOL_RECLAIM`: sweep empty 64 MiB texture blocks as soon as VRAM
+/// reaches 85 % of budget (even without `VICTORY_RESIDENCY=1`; `0`: as before;
+/// on by default).
+pub(crate) fn reclaim_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_POOL_RECLAIM") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_RECLAIM").is_none_or(|v| v != "0"))
+}
+
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        let limit = spares(memory, crate::host::keep_freed());
+        SPARES.store(limit, Ordering::Relaxed);
+        if reclaim_on()
+            && limit < SPARE_KEPT
+            && let Ok(mut pool) = TEXTURES.try_lock()
+        {
+            pool.reclaim(now(), limit, true);
+        }
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
@@ -68,11 +87,41 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     }
 }
 
+/// `VICTORY_SPARES_BY_HEADROOM=1` (off by default): how many empty blocks
+/// are kept follows the card's headroom below 85 % of its budget, instead
+/// of the all-or-nothing 4 GiB of [`SPARE_KEPT`]. A 16 GB card 12 GB in
+/// held 4 GiB of empty blocks with about a GB of its budget left, and the
+/// paging that followed ran at about a frame a second (#94; #76's 8-16 GB
+/// runs, `VICTORY_SPARES_BY_HEADROOM=0`: the binary choice, as before).
+/// At most half of what is left is kept, so what the title makes next has
+/// room; a 24 GB card 10 GB in keeps all 64 blocks, and one at 85 % or
+/// past it, or asked not to keep (memory pressure, [`room`]), keeps
+/// [`SPARE`] as before.
+fn by_headroom() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPARES_BY_HEADROOM").is_some_and(|v| v == "1"))
+}
+
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
-        _ => SPARE,
+    spares_of(memory, keep, by_headroom())
+}
+
+/// [`spares`], the choice made for it: [`SPARE_KEPT`] below 85 % of the
+/// budget as before, or with `by_headroom` at most half of what is left
+/// below it, in blocks.
+fn spares_of(memory: Option<[u64; 4]>, keep: bool, by_headroom: bool) -> usize {
+    let Some([budget, used, ..]) = memory else {
+        return SPARE;
+    };
+    if !keep {
+        return SPARE;
     }
+    if !by_headroom {
+        return if u128::from(used) * 100 < u128::from(budget) * 85 { SPARE_KEPT } else { SPARE };
+    }
+    let ceiling = u128::from(budget) * 85 / 100;
+    let headroom = ceiling.saturating_sub(u128::from(used));
+    ((headroom / 2 / u128::from(BLOCK)) as usize).clamp(SPARE, SPARE_KEPT)
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -200,6 +249,8 @@ struct Pool<B> {
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
     resting: VecDeque<(u64, Piece)>,
+    /// Bytes reserved by pieces, including those still resting after release.
+    unavailable: u64,
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
@@ -210,7 +261,7 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), unavailable: 0, spare: 0, most, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -260,6 +311,7 @@ impl<B: Clone> Pool<B> {
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
+        self.unavailable += len;
         if ripe.ahead > 0 {
             if !ripe.is(self.blocks[i].as_ref()?) {
                 let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -326,6 +378,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                self.unavailable -= piece.len;
                 any |= block.free.whole(BLOCK);
             }
         }
@@ -348,6 +401,13 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    fn reusable_bytes(&mut self, now: u64) -> u64 {
+        // Admission can stop new allocations. Expire resting pieces here
+        // too, so it can resume without needing a successful take first.
+        self.rested(now);
+        (self.blocks() as u64 * BLOCK).saturating_sub(self.unavailable)
+    }
 }
 
 /// A mapped upload buffer's memory.
@@ -363,13 +423,11 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bytes of the pieces textures hold now.
-static HELD: AtomicU64 = AtomicU64::new(0);
-
-/// Bytes of the texture blocks no texture holds: the card's memory in use
-/// by us that new textures take first.
+/// Free bytes in existing texture blocks, excluding reservations and pieces
+/// still resting after release. Aggregate space, not a guarantee that one
+/// contiguous allocation of that size fits.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    lock(&TEXTURES).reusable_bytes(now())
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -461,7 +519,6 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -696,7 +753,6 @@ pub(crate) unsafe fn texture(
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
     match (result, made) {
         (Ok(()), Some(made)) => {
-            HELD.fetch_add(piece.len, Ordering::Relaxed);
             give_back_with(&made, piece);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
@@ -730,6 +786,66 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reusable_bytes_exclude_reserved_and_resting_pieces() {
+        let mut pool = Pool::new(SPARE);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        // A piece is reserved before CreatePlacedResource can succeed.
+        assert_eq!(pool.reusable_bytes(0), BLOCK / 2);
+        pool.give(piece, 0);
+        assert_eq!(pool.reusable_bytes(REST - 1), BLOCK / 2);
+        // A budget query alone makes the rested piece available again.
+        assert_eq!(pool.reusable_bytes(REST), BLOCK);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.reusable_bytes(REST), 0);
+    }
+
+    #[test]
+    fn reusable_bytes_track_alignment_and_block_slot_reuse() {
+        let mut pool = Pool::new(SPARE);
+        let (first, _, _) = pool.take(100, 64, 0, || Some(1)).unwrap();
+        let (second, _, _) = pool.take(100, 64, 0, || Some(1)).unwrap();
+        assert_eq!((first.start, second.start), (0, 128));
+        assert_eq!(pool.reusable_bytes(0), BLOCK - 200);
+        // Alignment padding remains available to smaller allocations.
+        let (padding, _, _) = pool.take(28, 4, 0, || None).unwrap();
+        assert_eq!(padding.start, 100);
+        assert_eq!(pool.reusable_bytes(0), BLOCK - 228);
+        for piece in [first, second, padding] {
+            pool.give(piece, 0);
+        }
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.reusable_bytes(REST), 0);
+        let (next, _, _) = pool.take(512, 512, REST, || Some(2)).unwrap();
+        assert_eq!(next.block, first.block);
+        assert_eq!(pool.reusable_bytes(REST), BLOCK - 512);
+    }
+
+    #[test]
+    fn reusable_bytes_match_free_ranges_through_allocation_and_reclaim() {
+        let mut pool = Pool::new(SPARE);
+        let mut held = VecDeque::new();
+        for tick in 0..400 {
+            let now = tick * 100;
+            let size = (tick % 7 + 1) * 65536;
+            let ripe = Ripe { started: tick, finished: tick.saturating_sub(2), ahead: 2 };
+            let (piece, _, _) = pool.take_ripe(size, 65536, now, ripe, || Some(1)).unwrap();
+            held.push_back(piece);
+            if held.len() > 7 {
+                pool.give(held.pop_front().unwrap(), now);
+            }
+            let reusable = pool.reusable_bytes(now);
+            let free: u64 = pool.blocks.iter().flatten().flat_map(|b| b.free.0.values()).sum();
+            assert_eq!(reusable, free, "tick {tick}");
+        }
+        for piece in held {
+            pool.give(piece, 40000);
+        }
+        pool.reclaim(40000 + REST, 0, true);
+        assert_eq!(pool.reusable_bytes(40000 + REST), 0);
+        assert_eq!(pool.unavailable, 0);
+    }
 
     #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
@@ -788,6 +904,26 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    /// `VICTORY_SPARES_BY_HEADROOM=1`: at most half of what is left below
+    /// 85 % of the budget, in blocks, the ends kept as they are (#94).
+    #[test]
+    fn spares_follow_the_cards_headroom_when_asked() {
+        const GIB: u64 = 1 << 30;
+        let budget_of = |gib: u64| gib * GIB;
+        // A 24 GB card 10 GB in keeps all 64 blocks.
+        assert_eq!(spares_of(Some([budget_of(24), budget_of(10), 0, 0]), true, true), SPARE_KEPT);
+        // A 16 GB card 12 GB in: half of the ~1.6 GB left below 85 %, in
+        // 64 MiB blocks, is 12 blocks, not 4 GiB of them.
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(12), 0, 0]), true, true), 12);
+        // Past 85 %, or told not to keep, or nothing reported: as before.
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(15), 0, 0]), true, true), SPARE);
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(12), 0, 0]), false, true), SPARE);
+        assert_eq!(spares_of(None, true, true), SPARE);
+        // Off: the binary choice.
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(12), 0, 0]), true, false), SPARE_KEPT);
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(15), 0, 0]), true, false), SPARE);
     }
 
     #[test]
@@ -936,5 +1072,28 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn sweep_reclaims_empty_spares_without_new_allocations() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut pieces = Vec::new();
+        for n in 1u32..=5 {
+            let (piece, _, _) = pool.take(BLOCK / 2, 512, 0, || Some(n)).unwrap();
+            pieces.push(piece);
+            // Force a fresh block each time so 5 blocks exist.
+            let (other, _, _) = pool.take(BLOCK / 2, 512, 0, || unreachable!()).unwrap();
+            pool.give(other, 0);
+        }
+        pool.rested(REST + 1);
+        assert_eq!(pool.blocks(), 5);
+
+        // Return all pieces while `take` is no longer called (as when room is tight).
+        for piece in pieces {
+            pool.give(piece, 0);
+        }
+        // Dropping the limit below `SPARE_KEPT` and sweeping releases empty blocks down to `SPARE`.
+        pool.reclaim(REST + 1, SPARE, true);
+        assert_eq!(pool.blocks(), SPARE);
     }
 }

@@ -47,6 +47,10 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
     # Below 4K output, the interface on a 3840x2160 plane of its own (its menus are laid out in 4K pixels).
     $settings.VICTORY_UI_PLANE = '1'
+    # Two presents in the line: the title records the next frame while ours sends this one
+    # (avatarmanz/VIctory-7900XTX#379). Empty texture blocks kept follow the card's headroom
+    # instead of up to 4 GiB of them on a 12 GB card (avatarmanz/VIctory-7900XTX#285).
+    $settings.VICTORY_SUBMIT_FRAMES = '2'; $settings.VICTORY_SPARES_BY_HEADROOM = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 # The title takes its output size from its own settings (3840x2160 in a Series X dump), not from
