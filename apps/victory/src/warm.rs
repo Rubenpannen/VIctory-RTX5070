@@ -37,7 +37,16 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
-    let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
+    // Before the first run there is nothing to make (and no folder to note
+    // what was made in: opening the notes failed with "path not found").
+    if keys.is_empty() {
+        println!(
+            "no pipelines recorded yet in {}: each run of the title records those it makes, so play once, then warm",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let listed =std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
         if let Some((of, key)) = line.split_once(' ')
