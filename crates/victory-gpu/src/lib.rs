@@ -50,6 +50,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod launch;
+#[cfg(windows)]
 pub mod port_descriptors;
 #[cfg(windows)]
 mod land;

@@ -199,6 +199,18 @@ unsafe impl Send for Through {}
 // SAFETY: as above.
 unsafe impl Sync for Through {}
 
+/// Whether `texture` was cut from a block of the pool: it carries the private
+/// data `crate::pool` gives such a texture (the key below is the one
+/// `pool::give_back_with` sets). (From avatarmanz/VIctory-7900XTX#237,
+/// HenriqueSBueno.)
+fn in_block(texture: &ID3D12Resource) -> bool {
+    const KEY: windows::core::GUID =
+        windows::core::GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+    let mut size = 0u32;
+    // SAFETY: a size query of a live texture; no data is written.
+    unsafe { texture.GetPrivateData(&KEY, &mut size, None).is_ok() }
+}
+
 /// The copy buffers of [`alias`], by the placed view's texture.
 static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 
@@ -211,8 +223,15 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// and again whenever the list used `source` in another way since (wrote
 /// it, or read it itself). Leaves `placed` in the copy destination state,
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
-/// the texture from title memory, as before.
-pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+/// the texture from title memory, as before. `source` is the texture or a
+/// handle that holds it (`crate::resource::Held`), kept until this returns.
+pub(crate) fn alias(
+    list: &HostList,
+    placed: This,
+    source: impl std::borrow::Borrow<This>,
+) -> bool {
+    let held = source;
+    let source: This = *held.borrow();
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
@@ -866,7 +885,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    // Only one cut from a block: a committed texture (one the block refused,
+    // or a stand-in made elsewhere) takes no aliasing barrier, and the host
+    // refuses to close a list with one (`E_INVALIDARG`).
+    if crate::pool::on() && !staging.uploaded.load(Relaxed) && in_block(texture) {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

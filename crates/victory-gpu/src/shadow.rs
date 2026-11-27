@@ -2014,8 +2014,36 @@ fn back_piece(
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// compared, changed runs put in, their bytes, and pages put in past the
+/// cap of copies ([`masked_patch`]).
+static MERGED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether a page of a copy in the card's memory whose title bytes under
+/// flights' shader writes take more copies of their own than the submission
+/// has left (`runs_left` of `crate::host::stale_under_flights`, 512, or
+/// 4,096 with card steps) still goes in, its words as pairs of the one
+/// dispatch and its longer runs each a copy, instead of the merge giving up
+/// and the flights being settled (`VICTORY_MASKED_PATCH=1`, or its phase of
+/// `VICTORY_AB`; off by default, as before). Only with whole words
+/// (`crate::host::words_under`, on by default): by bytes every run is a copy.
+///
+/// fxceless/victory-fork 3221ac42 and 0e006f00 send such a page as a
+/// "masked patch", one dispatch storing the title's changed bytes of each
+/// dword after the flights, uncapped; there the settles "for more changed
+/// runs than VICTORY_MERGE_RUNS leaves" were most of the submitting thread's
+/// wait for the card (21 -> 2 ms, the usual frame 10-15 ms shorter). Here
+/// the short runs went as pairs of one dispatch already (`VICTORY_UNDER_WORDS`)
+/// and are not counted; what still met the cap is runs of more than 256
+/// bytes, which this lets through as copies. The pairs store whole words, as
+/// before (where the patch stores bytes under a mask).
+fn masked_patch() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_MASKED_PATCH") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_MASKED_PATCH"))
+}
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2055,8 +2083,8 @@ pub(crate) fn under_stats() -> [u64; 10] {
 }
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// Adds the time since it was made to [`UNDER_NS`]`[6]` when dropped.
@@ -3978,7 +4006,12 @@ impl Shadow {
                     return Ok(Some(runs));
                 }
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
-                    return Err(());
+                    // Past the cap: in all the same ([`masked_patch`]).
+                    let through = crate::host::words_under() && masked_patch();
+                    if !through {
+                        return Err(());
+                    }
+                    MERGED[3].fetch_add(1, Ordering::Relaxed);
                 }
                 let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
                 if !fused {

@@ -50,7 +50,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -415,14 +415,34 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
+/// The names of the pipelines being loaded now ([`same_name`]).
+static LOADING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Signalled whenever a load leaves [`LOADING`].
+static LOAD_FINISHED: Condvar = Condvar::new();
+
+/// A load of the pipeline of this name under way ([`same_name`]).
+struct PipelineLoad<'a>(&'a str);
+
+impl Drop for PipelineLoad<'_> {
+    fn drop(&mut self) {
+        LOADING.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        LOAD_FINISHED.notify_all();
+    }
+}
+
 /// Held by a load of the pipeline named `name`: loads of the same name
 /// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// safety: such a load may change that pipeline's entry). Loads of other
+/// names do not wait: names shared 64 locks before, and a load whose
+/// driver call took seconds held up every other name on its lock (7 to
+/// 15 s stalls; from fxceless/victory-fork#1442, Filip722).
+fn same_name(name: &str) -> PipelineLoad<'_> {
+    let loading = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut loading = LOAD_FINISHED
+        .wait_while(loading, |loading| loading.contains(name))
+        .unwrap_or_else(|e| e.into_inner());
+    loading.insert(name.to_owned());
+    PipelineLoad(name)
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -794,6 +814,46 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_concurrent_names_do_not_wait_on_each_other() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // These different names collided under the old 64-way lock hash.
+        let first = same_name("00000000000000000000000000000000");
+        let (loaded, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _second = same_name("00000000000000000000000000000022");
+            loaded.send(()).unwrap();
+        });
+        let result = finished.recv_timeout(Duration::from_secs(2));
+        drop(first);
+        worker.join().unwrap();
+        assert!(result.is_ok(), "loading another name must not wait for the first name");
+    }
+
+    #[test]
+    fn same_pipeline_name_waits_until_the_first_load_leaves() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const NAME: &str = "11111111111111111111111111111111";
+        let first = same_name(NAME);
+        let (trying, started) = mpsc::channel();
+        let (loaded, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            trying.send(()).unwrap();
+            let _second = same_name(NAME);
+            loaded.send(()).unwrap();
+        });
+        started.recv().unwrap();
+        let result = finished.recv_timeout(Duration::from_millis(50));
+        drop(first);
+        worker.join().unwrap();
+        assert_eq!(result, Err(mpsc::RecvTimeoutError::Timeout));
+        finished.try_recv().unwrap();
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

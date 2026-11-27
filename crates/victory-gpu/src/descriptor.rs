@@ -678,7 +678,14 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
-    let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [twins, moved, lost, exact] =
+        [0, 1, 2, 3].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if exact > 0 {
+        tracing::info!(
+            exact,
+            "raw twins made from their own dword, not on 16 bytes (VICTORY_TWIN_EXACT=0: null views), since the last line"
+        );
+    }
     if twins > 0 {
         tracing::info!(
             "raw twins of buffer views made per frame (VICTORY_RAW_VIEWS=0: none): {:.0}, of them {:.1} that do not begin on 16 bytes ({:.1} null)",
@@ -1475,11 +1482,15 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null description makes a null view (`View::Constant(0, 0)`) over what the
+/// slot showed before, which a shader would otherwise go on reading.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1871,6 +1882,24 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let mut heap = [0u64; 2 * 8]; // two 32-byte slots
+        let base = heap.as_mut_ptr() as u64;
+        let at = |i: usize| base + 32 * i as u64;
+        let (s0, s1) = (at(0), at(1));
+        create_cbv(null, &[0x1000, 1, 256, 0], s0);
+        assert_eq!(view(s0), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), s0);
+        assert_eq!(view(s0), Some(View::Constant(0, 0)));
+
+        create_srv(null, null, std::ptr::null(), s1);
+        assert_eq!(view(s1), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), s1);
+        assert_eq!(view(s1), Some(View::Constant(0, 0)));
     }
 
     #[test]

@@ -123,9 +123,9 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    LAUNCH_SPACE, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    mesh_payload_bytes, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -292,14 +292,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in SWITCHES.split(',').filter(|n| !n.is_empty()) {
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
-            out.extend_from_slice(value.as_encoded_bytes());
-        }
-        out.push(0);
-    }
+    switch_values(&mut out, SWITCHES, |name| std::env::var_os(name));
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
@@ -308,6 +301,25 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out
+}
+
+/// The fingerprint's part for the switches `names` lists (comma-separated),
+/// each value read through `value`: `NAME\0` when unset, `NAME=value\0`
+/// when set, so a switch set to nothing keys apart from an unset one
+/// (several count as on when merely set). Pure, for testing.
+fn switch_values(
+    out: &mut Vec<u8>,
+    names: &str,
+    value: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for name in names.split(',').filter(|n| !n.is_empty()) {
+        out.extend_from_slice(name.as_bytes());
+        if let Some(value) = value(name) {
+            out.push(b'=');
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
@@ -1236,6 +1248,30 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("127")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
+
+    /// Switches that count as on when merely set translate differently when
+    /// set to an empty value than when unset, so the cache key must tell the
+    /// two apart.
+    #[test]
+    fn a_switch_set_to_nothing_keys_apart_from_an_unset_one() {
+        use std::ffi::OsString;
+        let key = |a: Option<&str>, b: Option<&str>| {
+            let mut out = Vec::new();
+            super::switch_values(&mut out, "VICTORY_A,VICTORY_B", |name| match name {
+                "VICTORY_A" => a.map(OsString::from),
+                "VICTORY_B" => b.map(OsString::from),
+                other => panic!("{other} is not in the list"),
+            });
+            out
+        };
+        assert_ne!(key(None, None), key(Some(""), None));
+        assert_ne!(key(None, None), key(None, Some("")));
+        assert_ne!(key(Some(""), None), key(None, Some("")));
+        assert_ne!(key(Some(""), None), key(Some("1"), None));
+        // A value cannot run into the next switch's name.
+        assert_ne!(key(Some("x"), None), key(None, Some("x")));
+        assert_eq!(key(Some("1"), None), key(Some("1"), None));
     }
 
     #[test]
@@ -2549,7 +2585,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [7, 1, 1],
+                threads: [15, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -2592,7 +2628,36 @@ mod tests {
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
+                7.0f32,
+                3.0,
+                -1.0,
+                1e-40,
+                1.0,
+                1e35,
+                1e-35,
+                1e-36,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                -1e35,
+                1e35,
+                0.0,
+                1.0,
+                -0.0,
+                1.0,
+                0.0,
+                -2.0,
+                1.0,
+                f32::INFINITY,
+                -1.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::INFINITY,
+                1e38,
+                1e-38,
+                -1e38,
+                1e-38,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -2615,7 +2680,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
+            let got: Vec<f32> = out[0][..15].iter().copied().map(f32::from_bits).collect();
             assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
             assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
             assert!(
@@ -2638,6 +2703,15 @@ mod tests {
                 got[6],
                 out[0][6]
             );
+            // 0 / x and x / Inf are signed zeros; an overflowed quotient a signed infinity.
+            assert_eq!(out[0][7], 0.0f32.to_bits(), "+0/1");
+            assert_eq!(out[0][8], (-0.0f32).to_bits(), "-0/1");
+            assert_eq!(out[0][9], (-0.0f32).to_bits(), "+0/-2");
+            assert_eq!(out[0][10], 0.0f32.to_bits(), "1/+Inf");
+            assert_eq!(out[0][11], (-0.0f32).to_bits(), "-1/+Inf");
+            assert_eq!(out[0][12], 0xFFC0_0000, "+Inf/+Inf");
+            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "1e38/1e-38");
+            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "-1e38/1e-38");
         }
     }
 

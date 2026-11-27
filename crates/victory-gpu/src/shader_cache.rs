@@ -92,6 +92,9 @@ const KEYED: &[&str] = &[
     "VICTORY_D16_BITS",
     "VICTORY_NAN_GUARD",
     "VICTORY_SPILL_STRICT",
+    "VICTORY_LDS_INIT_HOIST",
+    "VICTORY_THREAD_TICKET",
+    "VICTORY_MESH_LAUNCH",
 ];
 
 /// Since the start: entries of an earlier build of the translator met,

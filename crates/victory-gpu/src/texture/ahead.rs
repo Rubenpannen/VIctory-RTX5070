@@ -13,7 +13,10 @@
 //! it as any texture.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU8, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -51,12 +54,13 @@ pub(crate) struct Job {
     staging: Arc<Staging>,
     copy: Arc<HostTexture>,
     asked: std::time::Instant,
-    /// What to do when it has run; `None`: it has.
+    /// What to do when it has run; `None`: it has. (Left as it is when the
+    /// copy failed: never called.)
     then: Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>,
 }
 
 impl Job {
-    /// Calls `f` when the copy has run: now if it has.
+    /// Calls `f` when the copy has run: now if it has, never if it failed.
     pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
         let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
         match then.as_mut() {
@@ -115,7 +119,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         || copy.holds.lock().unwrap_or_else(|e| e.into_inner()).is_some()
         || !crate::pool::fresh(&copy.texture)
         || super::host_wrote(resource as usize)
-        || crate::resource::alias_of(resource).is_some()
+        || crate::resource::has_alias(resource)
     {
         return turned_down();
     }
@@ -128,7 +132,10 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
     }) else {
-        copy.ahead.store(LISTED, Relaxed);
+        copy.ahead.store(LISTED, Release);
+        // (A list that found it on its way here waits in `listed`.)
+        let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        LANDED.notify_all();
         return turned_down();
     };
     if super::no_wait() && super::fill_unlocked() {
@@ -148,14 +155,27 @@ pub(crate) fn send(job: &Arc<Job>) {
 
 /// A list is about to record an upload into `copy`: one on its way here runs
 /// first, and no other is taken after it.
+///
+/// The wait is for the state, not for the job: [`claim`] marks the texture
+/// on its way before its job exists (the staging buffer is made in between,
+/// under the staging table's lock), and a list that looked for the job then
+/// went on at once and recorded the same upload on the drawing queue while
+/// the copy queue wrote the texture too (and the worker refreshed the
+/// staging buffer the list's copy read). Up to 1 s used to be waited: past
+/// it the same happened; now 10 s, said in the log. (From
+/// Belobug/VIctory-Belobug-AMD#536, MamaLeVrai.)
 pub(crate) fn listed(copy: &HostTexture) {
-    if copy.ahead.compare_exchange(NONE, LISTED, Relaxed, Relaxed) != Err(PENDING) {
+    if copy.ahead.compare_exchange(NONE, LISTED, Acquire, Acquire) != Err(PENDING) {
         return;
     }
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
+    while copy.ahead.load(Acquire) == PENDING {
+        if started.elapsed().as_secs() >= 10 {
+            tracing::warn!("an upload ahead of the lists did not run in 10 s: the list's own goes beside it");
+            return;
+        }
         way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
@@ -231,10 +251,14 @@ impl Worker {
                 }
             }
             value += 1;
-            if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
-            }
-            finish(jobs);
+            let ran = match self.copy(&jobs, value) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "uploads ahead did not run");
+                    false
+                }
+            };
+            finish(jobs, ran);
         }
     }
 
@@ -286,19 +310,28 @@ impl Job {
     }
 }
 
-/// The jobs' copies have run.
-fn finish(jobs: Vec<Arc<Job>>) {
+/// The jobs' copies have run, or failed (`ran` false): then the textures are
+/// not uploaded, a list's upload brings them, and what waits for the jobs is
+/// never called (from Belobug/VIctory-Belobug-AMD#454, matheusfrta).
+fn finish(jobs: Vec<Arc<Job>>, ran: bool) {
     for job in &jobs {
-        job.staging.uploaded.store(true, Relaxed);
-        job.staging.dirty.store(false, Relaxed);
-        job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        if ran {
+            job.staging.uploaded.store(true, Relaxed);
+            job.staging.dirty.store(false, Relaxed);
+            job.staging.note_held();
+            job.copy.ahead.store(DONE, Release);
+        } else {
+            job.copy.ahead.store(LISTED, Release);
+        }
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
         LANDED.notify_all();
+    }
+    if !ran {
+        return;
     }
     for job in &jobs {
         let us = job.asked.elapsed().as_micros() as u64;
@@ -327,7 +360,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
 /// Whether `resource`'s host copy was filled here: no list still brings what
 /// it shows.
 pub(crate) fn there(resource: This) -> bool {
-    crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Relaxed) == DONE)
+    crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Acquire) == DONE)
 }
 
 /// The state of [`HostTexture::ahead`] of a new host copy.
@@ -338,6 +371,59 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list that records an upload of a texture while [`claim`] is still
+    /// making its job (here: held at the staging table's lock, where it makes
+    /// the staging buffer) waits until the copy queue has run it (from
+    /// Belobug/VIctory-Belobug-AMD#536, MamaLeVrai).
+    #[test]
+    fn a_list_waits_for_an_upload_still_being_taken() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        // 256x256 BC7, nine levels (as below).
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: as above.
+        unsafe { (0..whole).for_each(|i| at.add(i).write((i * 7 + i / 311) as u8)) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        if !crate::pool::fresh(&copy.texture) {
+            return;
+        }
+        let held = super::super::STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = texture as usize;
+        let taker = std::thread::spawn(move || match claim(raw as This, 0, u64::MAX) {
+            Some(Taken::New(job)) => {
+                send(&job);
+                true
+            }
+            _ => false,
+        });
+        let started = std::time::Instant::now();
+        while copy.ahead.load(Relaxed) != PENDING {
+            assert!(started.elapsed().as_secs() < 10, "the claim never began");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // A draw's list records an upload of it now, on another thread.
+        let (told, heard) = std::sync::mpsc::channel();
+        let lister = copy.clone();
+        let list = std::thread::spawn(move || {
+            listed(&lister);
+            told.send(lister.ahead.load(Relaxed)).unwrap();
+        });
+        let early = heard.recv_timeout(std::time::Duration::from_millis(300));
+        drop(held);
+        assert!(taker.join().unwrap(), "taken ahead");
+        let seen = early.or_else(|_| heard.recv_timeout(std::time::Duration::from_secs(20)));
+        list.join().unwrap();
+        assert_eq!(seen, Ok(DONE), "the list went on while the upload ahead was still on its way");
+        assert!(there(texture));
+    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the

@@ -73,6 +73,7 @@
 # Editor / OS noise
 .vs/
 .idea/
+.claude/
 *.swp
 Thumbs.db
 .DS_Store

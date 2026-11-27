@@ -44,6 +44,34 @@ fn fence<'a>(this: This) -> &'a Fence {
     unsafe { &*this.cast::<Fence>() }
 }
 
+/// A reference of ours to a fence, for a wait or signal a queue holds back:
+/// the title may let the fence go before the command runs, and it was held
+/// by its address alone, so the held command read or set a freed fence
+/// (from Kelvaroq's patch 0036). Released when the command has run or is
+/// dropped with its queue.
+#[cfg(windows)]
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    /// A new reference to `this`, one of our fences.
+    pub(crate) fn retain(this: This) -> FenceRef {
+        object::add_ref(this);
+        FenceRef(this as usize)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.as_this());
+    }
+}
+
 pub(crate) extern "system" fn create(
     _: This,
     initial: u64,
