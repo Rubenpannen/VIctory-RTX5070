@@ -207,7 +207,7 @@ pub(crate) struct HostHeap {
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
     /// table; one a shader picks by a computed index is brought up to date
-    /// from here ([`HostHeap::texture_slots_due`]).
+    /// from here ([`HostHeap::texture_slots_due_known`]).
     textures: Mutex<TextureQueue>,
     /// Its slots ([`Queued`]).
     queued: std::sync::Arc<Queued>,
@@ -1008,9 +1008,10 @@ const TABLED_READ: u32 = 1 << 31;
 
 /// Since the start: writes of texture views into slots that count as a
 /// table's (due later), and slots that left the queue because a draw read
-/// them through a table.
-pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// them through a table; of the latter, those a draw read again in the
+/// frame of their first read ([`tabled_reread`]).
+pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether slots draws read through tables leave the queue of textures
 /// picked by index; `VICTORY_TABLED_TEXTURES=1` keeps them in it as
@@ -1018,6 +1019,28 @@ pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
 fn tabled_out() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
+}
+
+/// Whether a table read of a slot the queue holds leaves it out also when
+/// the slot was read through a table before in the same frame
+/// (`VICTORY_TABLED_REREAD=1`; off: once a frame, as before).
+///
+/// A slot leaves the queue at its first table read of a frame only. The
+/// title rewrites tables' slots while it records (a table per draw), so a
+/// slot written after that read waits in the queue `TABLED_GRACE` frames
+/// for a draw, and the draws that read it in the same frame do not take it
+/// out: the pass takes it 8 frames later and finds it uploaded by those
+/// draws, or nothing to do (17,000-58,000 slots in 5 s of a cutscene,
+/// coolfox-20261126-223059). On, such a read takes it out (asked by the
+/// queue's marks, [`Queued`]: needs `VICTORY_QUEUE_MARKS` on), and the
+/// draw's gate for records it told of already (`Listed::tabled`) lets a
+/// slot the queue holds through. Off by default: what a shader that picks
+/// such a slot by index sees then comes from the draw's making of it, not
+/// the pass's 8 frames later (a candidate of the flicker at scene loads).
+/// (From VIctory-NVIDIA 8625c3a, readmet3xt-lab.)
+pub(crate) fn tabled_reread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_some_and(|v| v == "1"))
 }
 
 /// What the queue of textures picked by index knows of a title slot.
@@ -1063,46 +1086,156 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
-    /// Which slots are in `slots`, for those who only want one out
-    /// ([`Queued`]).
+    /// Which slots are in `slots`, and the write of each entry, for those
+    /// who only want one out or would change nothing ([`Queued`]).
     queued: std::sync::Arc<Queued>,
 }
 
-/// A bit for each slot of a heap's [`TextureQueue`], changed under its lock
-/// and read without it: most of the 50,000 descriptors a frame written,
-/// looked at and made are not textures, and all of them took that lock to
-/// take nothing out of the queue (12 ms a frame of waiting, run city1).
-/// Empty: not known.
+/// For each slot of a heap's [`TextureQueue`], the write number of the
+/// entry it holds (0: none), changed under its lock and read without it:
+/// most of the 50,000 descriptors a frame written, looked at and made are
+/// not textures, and all of them took that lock to take nothing out of the
+/// queue (12 ms a frame of waiting, run city1). Empty: not known.
+///
+/// Whoever reads a mark while the queue changes it sees the slot as it was
+/// just before or just after: as if it had taken the lock a moment earlier
+/// or later, which it may always have done. Besides a take-out of a slot
+/// the queue does not hold (always), the marks spare the lock where nothing
+/// would change (`VICTORY_QUEUE_MARKS=0`: they do not, [`queue_marks`]): a
+/// slot made (not written) that the queue holds, which stays as it is; a
+/// stale view of a slot not held; and the pass's question whether a slot's
+/// entry is still the write it was handed ([`HostHeap::texture_slot_write`]).
+/// Other threads waited 33-44 s for the lock in a run of 150 s
+/// (coolfox-20261126-232343, -233017). (The write numbers from
+/// VIctory-NVIDIA 2ad55e6, readmet3xt-lab; the fork kept a bit a slot.)
 #[derive(Default)]
 pub(crate) struct Queued(Box<[std::sync::atomic::AtomicU64]>);
 
 impl Queued {
     fn new(slots: u32) -> Queued {
-        Queued((0..slots.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+        Queued((0..slots).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
     }
 
-    fn set(&self, slot: u32, there: bool) {
-        use std::sync::atomic::Ordering::SeqCst;
-        if let Some(word) = self.0.get(slot as usize / 64) {
-            let bit = 1 << (slot % 64);
-            if there {
-                word.fetch_or(bit, SeqCst);
-            } else {
-                word.fetch_and(!bit, SeqCst);
-            }
+    /// Under the queue's lock: `slot` holds the entry of write `write` (0:
+    /// none).
+    fn set(&self, slot: u32, write: u64) {
+        if let Some(mark) = self.0.get(slot as usize) {
+            mark.store(write, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     /// Whether `slot` may be in the queue.
     fn may(&self, slot: u32) -> bool {
-        let word = self.0.get(slot as usize / 64);
-        word.is_none_or(|w| w.load(std::sync::atomic::Ordering::SeqCst) >> (slot % 64) & 1 != 0)
+        self.write(slot).is_none_or(|write| write != 0)
     }
+
+    /// The write of `slot`'s entry (0: none); `None`: not known here (past
+    /// the marks), the queue knows.
+    fn write(&self, slot: u32) -> Option<u64> {
+        Some(self.0.get(slot as usize)?.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Whether the queue's marks ([`Queued`]) spare its lock also where a note
+/// would change nothing, beyond a take-out of a slot it does not hold
+/// (`VICTORY_QUEUE_MARKS=0`: they do not, as before). (From VIctory-NVIDIA
+/// 2ad55e6, readmet3xt-lab.)
+fn queue_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_MARKS").is_none_or(|v| v != "0"))
+}
+
+/// The queue's lock was not taken at place `site` (`super::queue_site`), as
+/// nothing would have changed: counted in `super::QUEUE_LOCK`, by the
+/// thread in batches (these happen hundreds of thousands of times in five
+/// seconds, on many threads at once). (From VIctory-NVIDIA 2ad55e6,
+/// readmet3xt-lab.)
+fn not_taken(site: usize) {
+    use super::queue_site::COUNT;
+    const BATCH: u32 = 64;
+    thread_local! {
+        static NOT_TAKEN: std::cell::Cell<[u32; COUNT]> = const { std::cell::Cell::new([0; COUNT]) };
+    }
+    NOT_TAKEN.with(|n| {
+        let mut counts = n.get();
+        counts[site] += 1;
+        if counts[site] >= BATCH {
+            super::QUEUE_LOCK[3][site].fetch_add(u64::from(counts[site]), std::sync::atomic::Ordering::Relaxed);
+            counts[site] = 0;
+        }
+        n.set(counts);
+    });
+}
+
+/// Whether a slot's record of a texture object the host renders to or writes
+/// (a target, depth or unordered access texture: not `resource::title_fills`)
+/// is queued for the pass over textures picked by index, as any texture
+/// (`VICTORY_QUEUE_HOST_TEXTURES=0`: it is not; the slot leaves the queue as
+/// a buffer view's would).
+///
+/// The pass takes such a slot and finds nothing to bring up to date: it
+/// neither makes nor uploads anything for it, and takes it out
+/// (`draw.rs` `heap_textures`, the first of its "nothing to bring up to
+/// date"). The title writes such views into its tables' slots every frame,
+/// so they are queued again and again, take the queue's lock, and stand
+/// among the slots due (58,978 of 90,699 slots the pass took in 5 s of a
+/// cutscene found nothing to do, coolfox-20261126-233017). Off by default:
+/// the slots due are fewer, so a pass reaches others sooner, the catch-up
+/// budget (`VICTORY_TEXTURE_CATCHUP`, by the count due) starts less often,
+/// and a bake's pass is asked less often (the queue's write count). (From
+/// VIctory-NVIDIA 5dda41d, readmet3xt-lab.)
+pub(crate) fn queue_host_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_HOST_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Records of textures the host writes left out of the queue
+/// ([`queue_host_textures`]) since the start, counted by each thread in
+/// batches.
+pub(crate) static HOST_TEXTURES_LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn host_texture_left_out() {
+    const BATCH: u32 = 64;
+    thread_local! {
+        static N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    N.with(|n| {
+        let now = n.get() + 1;
+        if now >= BATCH {
+            HOST_TEXTURES_LEFT_OUT.fetch_add(u64::from(now), std::sync::atomic::Ordering::Relaxed);
+            n.set(0);
+        } else {
+            n.set(now);
+        }
+    });
 }
 
 /// Slots due of a [`TextureQueue`], of those looked at before and of the
 /// others: the slot and its write's number.
 type Due = [Vec<(u32, u64)>; 2];
+
+/// What [`TextureQueue::recheck`] noted of a slot uploaded whole: where its
+/// memory is (address, bytes), its fingerprint, the looks that found it
+/// unchanged, the frame of the upload, the looks still due one frame apart.
+pub(crate) type Checked = (u64, u64, u64, u8, u64, u8);
+
+/// What the pass over textures picked by index found of a slot it took, as
+/// told to the queue ([`HostHeap::texture_slots_told`]). (From
+/// VIctory-NVIDIA abf1020, readmet3xt-lab.)
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Told {
+    /// Up to date ([`HostHeap::texture_slot_done`]): due again from frame
+    /// `.0` with `.1` bytes of its memory there, or not until written.
+    Done(Option<(u64, u64)>),
+    /// Uploaded whole, looked at again ([`HostHeap::texture_slot_recheck`]):
+    /// from frame, memory (address, bytes), fingerprint, looks, upload
+    /// frame, looks still due one frame apart.
+    Recheck(u64, (u64, u64), u64, u8, u64, u8),
+    /// Nothing to upload now ([`HostHeap::texture_slot_later`]): frame, most.
+    Later(u64, u64),
+    /// No room on the card ([`HostHeap::texture_slot_held`]): until frame.
+    Held(u64),
+}
 
 /// Whether due texture slots are served in turns, one looked at before and
 /// one never looked at ([`TextureQueue::in_order`]). On by default;
@@ -1113,16 +1246,18 @@ fn fair_due() -> bool {
 }
 
 impl TextureQueue {
+    /// Slot `index` holds `waiting` now (and its mark that write).
     fn insert(&mut self, index: u32, waiting: Waiting) {
-        if self.slots.insert(index, waiting).is_none() {
-            self.queued.set(index, true);
-        }
+        let write = waiting.write;
+        self.slots.insert(index, waiting);
+        self.queued.set(index, write);
     }
 
+    /// Slot `index` leaves the queue; whether it was there.
     fn take_out(&mut self, index: u32) -> bool {
         let was = self.slots.remove(&index).is_some();
         if was {
-            self.queued.set(index, false);
+            self.queued.set(index, 0);
         }
         was
     }
@@ -1178,10 +1313,24 @@ impl TextureQueue {
     }
 
     /// The slots due at `frame`, for [`TextureQueue::in_order`].
+    #[cfg(test)]
     fn all_due(&self, frame: u64) -> Due {
+        self.all_due_known(frame, None)
+    }
+
+    /// [`TextureQueue::all_due`], and into `known` (if asked) what
+    /// [`TextureQueue::checked`] says of each due slot that waits for a
+    /// look again, in slot order. (From VIctory-NVIDIA abf1020,
+    /// readmet3xt-lab.)
+    fn all_due_known(&self, frame: u64, mut known: Option<&mut Vec<(u32, Checked)>>) -> Due {
         let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             due[usize::from(w.looks == 0 && w.mapped == 0)].push((index, w.write));
+            if w.checked.2 != 0
+                && let Some(known) = known.as_deref_mut()
+            {
+                known.push((index, w.checked));
+            }
         }
         due
     }
@@ -1350,7 +1499,7 @@ impl TextureQueue {
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, u8)> {
+    fn checked(&self, index: u32) -> Option<Checked> {
         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
     }
 
@@ -2074,7 +2223,71 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// The queue of textures picked by index, locked by place `site`
+/// (`super::queue_site`): for the places that hold it for many slots at a
+/// time, how long it was held is counted when it is let go. (From
+/// VIctory-NVIDIA 4cee21f, readmet3xt-lab.)
+struct QueueGuard<'a> {
+    queue: std::sync::MutexGuard<'a, TextureQueue>,
+    held: Option<(usize, std::time::Instant)>,
+}
+
+impl std::ops::Deref for QueueGuard<'_> {
+    type Target = TextureQueue;
+    fn deref(&self) -> &TextureQueue {
+        &self.queue
+    }
+}
+
+impl std::ops::DerefMut for QueueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut TextureQueue {
+        &mut self.queue
+    }
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        if let Some((site, since)) = self.held {
+            super::QUEUE_LOCK[2][site].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl HostHeap {
+    /// The queue of textures picked by index, locked by place `site`
+    /// (`super::queue_site`); the lock taken, a wait for it, and how long
+    /// the places that hold it for many slots held it are counted
+    /// (`super::LOCK_WAITS`, `super::QUEUE_LOCK`). (From VIctory-NVIDIA
+    /// 0b651fa and 4cee21f, readmet3xt-lab.)
+    fn queue(&self, site: usize) -> QueueGuard<'_> {
+        use super::queue_site::{DUE, MADE_DUE, STALE};
+        use std::sync::atomic::Ordering::Relaxed;
+        let queue = match self.textures.try_lock() {
+            Ok(queue) => queue,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let started = std::time::Instant::now();
+                let queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                super::QUEUE_LOCK[1][site].fetch_add(super::waited(0, started), Relaxed);
+                queue
+            }
+        };
+        super::QUEUE_LOCK[0][site].fetch_add(1, Relaxed);
+        let held = matches!(site, DUE | MADE_DUE | STALE).then(|| (site, std::time::Instant::now()));
+        QueueGuard { queue, held }
+    }
+
+    /// Whether the queue holds title slot `index`, by its marks
+    /// ([`Queued`]), without its lock; `None`: ask the queue (the marks
+    /// are not used, [`queue_marks`], or do not reach the slot). (From
+    /// VIctory-NVIDIA 2ad55e6, readmet3xt-lab, where it is `queued`.)
+    fn holds(&self, index: u32) -> Option<bool> {
+        if !queue_marks() {
+            return None;
+        }
+        self.queued.write(index).map(|write| write != 0)
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -2128,18 +2341,76 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
+    #[cfg(test)]
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let (due, census) = {
-            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            let textures = self.queue(super::queue_site::DUE);
             (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
         };
         (TextureQueue::in_order(due, max, fair_due()), census)
     }
 
+    /// Up to `max` title slots whose texture view is due at `frame`, each
+    /// with its write number, in the order to serve them
+    /// ([`TextureQueue::due`]); beside each slot what
+    /// [`TextureQueue::checked`] said of it then, read in the same take of
+    /// the lock (the pass asked it slot by slot, under the lock each time);
+    /// and the queue's counts ([`TextureQueue::census`]). (From
+    /// VIctory-NVIDIA abf1020, readmet3xt-lab; the order is still made
+    /// outside the lock.)
+    pub(crate) fn texture_slots_due_known(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>, [u64; 5]) {
+        // (In slot order, as the queue holds its slots.)
+        let mut checked: Vec<(u32, Checked)> = Vec::new();
+        let (due, census) = {
+            let textures = self.queue(super::queue_site::DUE);
+            let due = if max == 0 { Due::default() } else { textures.all_due_known(frame, Some(&mut checked)) };
+            (due, textures.census(frame))
+        };
+        let order = TextureQueue::in_order(due, max, fair_due());
+        let known = order
+            .iter()
+            .map(|&(index, _)| checked.binary_search_by_key(&index, |k| k.0).ok().map(|at| checked[at].1))
+            .collect();
+        (order, known, census)
+    }
+
+    /// The write of the entry the queue holds for title slot `index`, by its
+    /// marks (0: none; [`Queued`]); `None`: not known so (ask the queue).
+    /// (From VIctory-NVIDIA abf1020, readmet3xt-lab.)
+    pub(crate) fn texture_slot_write(&self, index: u32) -> Option<u64> {
+        if !queue_marks() {
+            return None;
+        }
+        self.queued.write(index)
+    }
+
+    /// What the pass found of slots it took, each with the write it was
+    /// handed, told under one take of the lock, as
+    /// [`HostHeap::texture_slot_done`], `_recheck`, `_later` and `_held`
+    /// tell it one at a time. Leaves `told` empty. (From VIctory-NVIDIA
+    /// abf1020, readmet3xt-lab.)
+    pub(crate) fn texture_slots_told(&self, told: &mut Vec<(u32, u64, Told)>) {
+        if told.is_empty() {
+            return;
+        }
+        let mut textures = self.queue(super::queue_site::TELL);
+        for (index, write, what) in told.drain(..) {
+            match what {
+                Told::Done(Some((due, mapped))) => textures.partly(index, write, due, mapped),
+                Told::Done(None) => textures.done(index, write),
+                Told::Recheck(due, at, print, looks, uploaded, lively) => {
+                    textures.recheck(index, write, due, at, print, looks, uploaded, lively);
+                }
+                Told::Later(frame, most) => textures.later(index, write, frame, most),
+                Told::Held(due) => textures.hold(index, write, due),
+            }
+        }
+    }
+
     /// A number that changes when a slot is written or made due anew, and
     /// whether memory was noted since a pass last took the notes.
     pub(crate) fn texture_news(&self) -> (u64, bool) {
-        let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
+        let writes = self.queue(super::queue_site::OTHER).writes;
         let noted = |ranges: &Mutex<Ranges>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
     }
@@ -2149,7 +2420,7 @@ impl HostHeap {
     /// look): for the card accounting line
     /// (`crate::resource::card_accounting`).
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let textures = self.queue(super::queue_site::OTHER);
         textures
             .slots
             .iter()
@@ -2163,13 +2434,13 @@ impl HostHeap {
     /// that many bytes of its memory there, not all), or not until the
     /// slot is written again.
     pub(crate) fn texture_slot_since(&self, index: u32) -> Option<(u64, bool, u64)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).since(index)
+        self.queue(super::queue_site::TELL).since(index)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
     /// was brought up to date: see [`HostHeap::texture_slot_done`].
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.queue(super::queue_site::TELL);
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
             None => textures.done(index, write),
@@ -2189,37 +2460,37 @@ impl HostHeap {
         uploaded: u64,
         lively: u8,
     ) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.queue(super::queue_site::TELL);
         textures.recheck(index, write, due, at, print, looks, uploaded, lively);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, u8)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<Checked> {
+        self.queue(super::queue_site::TELL).checked(index)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.queue(super::queue_site::TELL);
         textures.later(index, write, frame, most);
     }
 
     /// See [`TextureQueue::hold`].
     pub(crate) fn texture_slot_held(&self, index: u32, write: u64, due: u64) {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).hold(index, write, due);
+        self.queue(super::queue_site::TELL).hold(index, write, due);
     }
 
     /// See [`TextureQueue::room`].
     pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).room(frame)
+        self.queue(super::queue_site::MADE_DUE).room(frame)
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+        self.queue(super::queue_site::TELL).mapped(index)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -2247,7 +2518,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -2272,7 +2543,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -2312,7 +2583,7 @@ impl HostHeap {
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
@@ -2402,7 +2673,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -2762,6 +3033,11 @@ impl HostHeap {
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
+        self.tabled_in_as(index, read, frame, tabled_reread());
+    }
+
+    /// [`HostHeap::tabled_in`], with [`tabled_reread`] as `reread` says.
+    fn tabled_in_as(&self, index: u32, read: bool, frame: u64, reread: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
             return;
@@ -2777,13 +3053,36 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() && self.queued.may(index) {
-                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if tabled_out() {
+                // Not in the queue: nothing to take out.
+                if !self.queued.may(index) {
+                    not_taken(super::queue_site::TABLE);
+                    return;
+                }
+                let mut textures = self.queue(super::queue_site::TABLE);
                 if textures.take_out(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
+        } else if tabled_out() && reread && self.holds(index) == Some(true) {
+            // Read again in the frame of its first read, and queued since
+            // that read (the title wrote it again, due `TABLED_GRACE` frames
+            // on): this draw brought it up to date too. Asked by the marks
+            // alone (without them, every read would take the lock). (From
+            // VIctory-NVIDIA 8625c3a, readmet3xt-lab.)
+            let mut textures = self.queue(super::queue_site::TABLE);
+            if textures.take_out(index) {
+                TABLED_WRITES[1].fetch_add(1, Relaxed);
+                TABLED_WRITES[2].fetch_add(1, Relaxed);
+            }
         }
+    }
+
+    /// Whether title slot `index` is in the queue of textures picked by
+    /// index, by its marks ([`Queued`]; false if they are not used,
+    /// [`queue_marks`]). (From VIctory-NVIDIA 8625c3a, readmet3xt-lab.)
+    pub(crate) fn texture_slot_queued(&self, index: u32) -> bool {
+        self.holds(index) == Some(true)
     }
 
     /// Whether title slot `index` was a table's within the last
@@ -2814,12 +3113,22 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        let keeps = texture && !read_now;
         // (A slot is written by one thread at a time.)
-        if !(texture && !read_now) && !self.queued.may(index) {
+        if !keeps && !self.queued.may(index) {
+            not_taken(super::queue_site::WRITE);
             return;
         }
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        if texture && !read_now {
+        // Nor does anything change when a slot made (not written) is one the
+        // queue holds: it stays as it is (`TextureQueue::written`). (A write
+        // always changes the queue.) (From VIctory-NVIDIA 2ad55e6,
+        // readmet3xt-lab.)
+        if keeps && seen && self.holds(index) == Some(true) {
+            not_taken(super::queue_site::WRITE);
+            return;
+        }
+        let mut textures = self.queue(super::queue_site::WRITE);
+        if keeps {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
@@ -2880,7 +3189,13 @@ impl HostHeap {
             }
             Some(View::Shader(r, _)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                true
+                // A texture the host renders to or writes: nothing for the
+                // pass to bring up to date ([`queue_host_textures`]). (From
+                // VIctory-NVIDIA 5dda41d, readmet3xt-lab.)
+                queue_host_textures() || crate::resource::title_fills(*r as crate::object::This) || {
+                    host_texture_left_out();
+                    false
+                }
             }
             _ => false,
         };
@@ -2939,9 +3254,16 @@ impl HostHeap {
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            for &(slot, _) in &stale {
-                textures.remove(slot);
+            // Only the ones the queue may hold, by its marks. (From
+            // VIctory-NVIDIA 2ad55e6, readmet3xt-lab.)
+            let queued: Vec<u32> = stale.iter().map(|&(slot, _)| slot).filter(|&slot| self.holds(slot) != Some(false)).collect();
+            if queued.is_empty() {
+                not_taken(super::queue_site::STALE);
+            } else {
+                let mut textures = self.queue(super::queue_site::STALE);
+                for slot in queued {
+                    textures.remove(slot);
+                }
             }
         }
         let stride = view.and_then(view_stride);
@@ -3616,7 +3938,7 @@ impl HostHeap {
     /// `index` at `frame`, in a few words (diagnostics).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let textures = self.queue(super::queue_site::OTHER);
         match textures.slots.get(&index) {
             None => "not queued".into(),
             Some(w) => format!(
@@ -6604,6 +6926,172 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+        // Notes that change nothing (taken out of a queue that does not
+        // hold the slot, made as the queue holds it) leave it as it is,
+        // and its marks say what it holds. (From VIctory-NVIDIA 2ad55e6,
+        // readmet3xt-lab.)
+        let marks = |heap: &HostHeap| (0..8).map(|i| heap.holds(i)).collect::<Vec<_>>();
+        let held = |queued: &[u32]| (0..8).map(|i| queue_marks().then_some(queued.contains(&i))).collect::<Vec<_>>();
+        assert_eq!(marks(&heap), held(&[2]));
+        heap.queue_texture(5, false, false, frame + 4 + TABLED_FRAMES);
+        heap.queue_texture(2, true, true, frame + 4 + TABLED_FRAMES);
+        heap.tabled_in(6, true, frame + 4 + TABLED_FRAMES);
+        assert_eq!(slots(u64::MAX), [2]);
+        assert_eq!(marks(&heap), held(&[2]));
+        heap.queue_texture(2, false, false, frame + 5 + TABLED_FRAMES);
+        assert_eq!(slots(u64::MAX), []);
+        assert_eq!(marks(&heap), held(&[]));
+    }
+
+    /// The queue's marks say which slots it holds, by the write of each
+    /// entry: set by writes and memory made due, kept by looks, uploads in
+    /// part and makes of a slot it holds, cleared when the slot leaves.
+    /// (From VIctory-NVIDIA 2ad55e6, readmet3xt-lab.)
+    #[test]
+    fn the_texture_queue_marks_what_it_holds() {
+        let marks = std::sync::Arc::new(Queued::new(32));
+        let mut q = TextureQueue { queued: marks.clone(), ..Default::default() };
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        q.written(1, 1, 0, false);
+        q.written(2, 1, 0, false);
+        let w1 = write(&q, 1);
+        assert_eq!(marks.write(1), Some(w1));
+        // Made as it is held: the entry and its mark stay.
+        q.written(1, 2, 0, true);
+        assert_eq!(marks.write(1), Some(w1));
+        q.done(1, w1);
+        assert_eq!(marks.write(1), Some(0));
+        // Written again; a done of the old write changes nothing.
+        q.written(1, 3, 0, false);
+        let w1b = write(&q, 1);
+        q.done(1, w1);
+        assert_eq!(marks.write(1), Some(w1b));
+        // Made due by memory: the new write is marked.
+        q.changed(1, 4, 5);
+        assert_eq!(marks.write(1), Some(write(&q, 1)));
+        assert_ne!(marks.write(1), Some(w1b));
+        // Looks, uploads in part and looks again keep entry and mark.
+        let w2 = write(&q, 2);
+        q.later(2, w2, 4, 4);
+        q.partly(2, w2, 6, 4096);
+        q.recheck(2, w2, 8, (0x1000, 4096), 7, 0, 6, 0);
+        q.hold(2, w2, 9);
+        assert_eq!(marks.write(2), Some(w2));
+        q.remove(2);
+        assert_eq!(marks.write(2), Some(0));
+        assert!(q.take_out(1));
+        assert!(!q.take_out(1));
+        assert_eq!(marks.write(1), Some(0));
+        // Past the marks: not known, so maybe there.
+        assert_eq!(marks.write(32), None);
+        assert!(marks.may(32));
+        // A queue made without marks works as one with them.
+        let mut plain = TextureQueue::default();
+        plain.written(40, 1, 0, false);
+        assert!(plain.take_out(40));
+    }
+
+    /// The slots due come in their order with what the queue knew of each
+    /// (a slot uploaded whole and waiting for a look again), as asked slot
+    /// by slot. (From VIctory-NVIDIA abf1020, readmet3xt-lab.)
+    #[test]
+    fn the_slots_due_come_with_what_is_known_of_them() {
+        let Some(heap) = HostHeap::new(false, 64) else {
+            return; // no host GPU
+        };
+        for i in 30..34u32 {
+            heap.queue_texture(i, true, false, 1);
+        }
+        let handed = heap.texture_slots_due(u64::MAX, 100).0;
+        let w = |index: u32| handed.iter().find(|d| d.0 == index).unwrap().1;
+        heap.texture_slot_recheck(31, w(31), 5, (0x2000, 4096), 9, 0, 2, 0);
+        heap.texture_slot_later(32, w(32), 2, 4);
+        let (order, known, _) = heap.texture_slots_due_known(u64::MAX, 100);
+        assert_eq!(order, heap.texture_slots_due(u64::MAX, 100).0);
+        assert_eq!(known.len(), order.len());
+        for (&(index, _), knew) in order.iter().zip(&known) {
+            assert_eq!(*knew, heap.texture_slot_checked(index));
+        }
+        assert_eq!(known.iter().filter(|k| k.is_some()).count(), 1);
+        let (order, known, _) = heap.texture_slots_due_known(u64::MAX, 1);
+        assert_eq!((order.len(), known.len()), (1, 1));
+    }
+
+    /// What the pass tells of several slots under one take of the lock ends
+    /// as told slot by slot. (From VIctory-NVIDIA abf1020, readmet3xt-lab.)
+    #[test]
+    fn slots_told_together_end_as_told_one_at_a_time() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 8), HostHeap::new(false, 8)) else {
+            return; // no host GPU
+        };
+        for heap in [&a, &b] {
+            for i in 0..6 {
+                heap.queue_texture(i, true, false, 10);
+            }
+        }
+        let due = |heap: &HostHeap, at: u64| heap.texture_slots_due(at, 8).0;
+        let handed = due(&a, u64::MAX);
+        assert_eq!(handed, due(&b, u64::MAX));
+        let w = |i: u32| handed.iter().find(|d| d.0 == i).unwrap().1;
+        let what = [
+            (0, Told::Done(None)),
+            (1, Told::Done(Some((12, 4096)))),
+            (2, Told::Recheck(14, (0x1000, 64), 7, 0, 10, 0)),
+            (3, Told::Later(10, 4)),
+            (4, Told::Held(30)),
+            // A write the queue does not hold any more: dropped.
+            (5, Told::Done(None)),
+        ];
+        let mut told: Vec<_> = what.iter().map(|&(i, t)| (i, if i == 5 { 0 } else { w(i) }, t)).collect();
+        a.texture_slots_told(&mut told);
+        assert!(told.is_empty());
+        b.texture_slot_done(0, w(0), None);
+        b.texture_slot_done(1, w(1), Some((12, 4096)));
+        b.texture_slot_recheck(2, w(2), 14, (0x1000, 64), 7, 0, 10, 0);
+        b.texture_slot_later(3, w(3), 10, 4);
+        b.texture_slot_held(4, w(4), 30);
+        b.texture_slot_done(5, 0, None);
+        for at in [10, 11, 12, 14, 30, u64::MAX] {
+            assert_eq!(due(&a, at), due(&b, at), "due at {at}");
+        }
+        for i in 0..6 {
+            assert_eq!(a.texture_slot_checked(i), b.texture_slot_checked(i));
+            assert_eq!(a.texture_slot_mapped(i), b.texture_slot_mapped(i));
+            assert_eq!(a.texture_slot_write(i).map(|w| w != 0), b.texture_slot_write(i).map(|w| w != 0));
+        }
+    }
+
+    /// A slot written after its first table read of a frame waits for its
+    /// grace frames; a later read in that frame takes it out only with
+    /// `VICTORY_TABLED_REREAD=1` (`tabled_in_as`'s `reread`). (From
+    /// VIctory-NVIDIA 8625c3a, readmet3xt-lab.)
+    #[test]
+    fn a_slot_written_after_its_read_leaves_at_the_next_read_when_asked() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !tabled_out() || !queue_marks() {
+            return;
+        }
+        let frame = 200;
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        heap.tabled_in_as(4, true, frame, true);
+        heap.queue_texture(4, true, false, frame);
+        assert_eq!(slots(frame + TABLED_GRACE - 1), []);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        // Read again in that frame, as before: it stays.
+        heap.tabled_in_as(4, true, frame, false);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        // With the re-read: out, and counted.
+        let before = TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed);
+        heap.tabled_in_as(4, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
+        assert!(TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(!heap.texture_slot_queued(4));
+        // A slot not queued: nothing to take out.
+        heap.tabled_in_as(5, true, frame, true);
+        heap.tabled_in_as(5, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
     }
 
     #[test]

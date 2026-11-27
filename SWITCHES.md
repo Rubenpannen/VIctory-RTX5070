@@ -69,9 +69,10 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_CARD_REHASH_RUNS` | Hashes pieces re-hashed after ranges are sent up in runs of touching pieces, so each is hashed once. *Set by `scripts\play.ps1`.* | off | 1 = on; unset/other = off |
 | `VICTORY_CARD_ROOM_FOR_BUFFERS` | Makes the texture queue keep room on the card for card copies of title buffers not yet made. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | Sets how much card memory the texture queue leaves free for render targets and other not-yet-made host copies. | 3072 MiB | &lt;MiB, integer>; capped at 8192 |
+| `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS` | Gives up the card memory kept back for render targets once they hold half of it and have not grown 64 MiB for this long. | 20000 | &lt;milliseconds, integer>; 0 = keep the reserve all run, as before |
 | `VICTORY_CARD_SPANS` | Measures how long the card itself works on our submissions, using its own timestamps, and logs it. *Diagnostics build only.* | off | 1 = on; unset/other = off |
 | `VICTORY_CARD_STEPS` | Does steps of a submission that read in-flight title memory on the card, in the flights' order, instead of on the CPU. *Set by `scripts\play.ps1`.* | 0 (off) | 1 = stage 1; 2 = stage 2; other = off |
-| `VICTORY_CARD_WINDOWS_MB` | Sets the most bytes of memory windows outside buffers that may have copies in the card's memory. | 0 (none) | &lt;MiB, integer> |
+| `VICTORY_CARD_WINDOWS_MB` | Sets the most bytes of memory windows outside buffers that may have copies in the card's memory; `auto` sizes it from the card's budget. | 0 (none) | &lt;MiB, integer>; auto = 9 % of the budget, at most 1024 MiB (about 1,000 MiB on a 12 GB card) |
 | `VICTORY_CLZERO_ASK` | Makes the console block-zero instruction ask Windows about memory every time instead of remembering answers per thread. | off (answers are remembered per thread) | 1 = ask Windows every time; other = remember |
 | `VICTORY_COMMITTED_QUERY` | Checks whether title pages are readable with VirtualQuery, as before, instead of the faster kernel page query. | off | 1 = on; unset/other = off |
 | `VICTORY_CONFIG` | Names the configuration file to use instead of ./victory.toml. | ./victory.toml | &lt;file path>; empty = unset |
@@ -132,6 +133,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_FIRSTLANE_OWN` | Makes the shader translator take the host wave's own first lane where the console reads its first lane. | off | 1 = on; unset or anything else = off |
 | `VICTORY_FIRST_HALF` | Lets the translator evaluate a first-half interpolation as the full pair when a first attempt at the shader was refused. | on | 0 = off; anything else or unset = on |
 | `VICTORY_FRAME_INTERVAL_MS` | Sets the title's frame interval, patched into the title's code and used by our frame clock. | not set (title's own) | &lt;milliseconds, decimal 0 to 1000>; 0 = no wait at all |
+| `VICTORY_FRESH_OPEN` | Leaves the host list made for a title's new list open for its next reset instead of closing it at once. | on | 0 = closed at once, as before; anything else = on |
 | `VICTORY_FULL_CARD_PASS` | When the card is full, holds back texture slots needing a new host copy and carries on with the slots behind them. | on | 0 = off; anything else or unset = on |
 | `VICTORY_GAME_DIR` | Sets the folder holding the title's files, overriding the one in victory.toml. | from victory.toml | &lt;folder path> |
 | `VICTORY_GPU_LOAD_MS` | Makes the title's four per-frame GPU timestamps report the given load, so its GPU time looks non-zero. | 0 (timestamps as they are) | &lt;milliseconds, integer> of GPU time to report per frame |
@@ -146,6 +148,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_HEAP_SYNC` | Mirrors changed descriptor heap pages into the host heap before lists are sent to the queue. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HEAP_SYNC_ASIDE` | Does a submission's descriptor heap sync on its own thread beside the rest of the preparing. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HEAP_SYNC_EARLY` | Sets how long the heap sync thread waits for a submission before making a round of its own. | 4 | &lt;milliseconds, integer>; 0 = none |
+| `VICTORY_HEAP_SYNC_FIRST` | Starts a submission's round of the heaps' records as soon as it holds the submission lock. | off | unset or 0 = off; anything else = on |
 | `VICTORY_HEAP_TEXTURES` | Uploads textures placed in memory that is not fully mapped yet with what is there, and re-checks them later. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HELD_LEVELS` | Reads, keeps and uploads a placed texture only from the first mip level its views actually show. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HELPER_OWN` | Makes a pixel shader's helper lane read its own value where the console reads the first lane's. | on | 0 = off; anything else or unset = on |
@@ -229,6 +232,9 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_PAGE_PARTS` | Copies only the 4 KiB parts of a page the kernel says were written, not the whole 64 KiB page. | on | 0 = off; anything else or unset = on |
 | `VICTORY_PAGE_WRITES` | Chooses what happens when title memory is written without the page guards noticing: reopen guarded host copies and/or mark texture slots due. | 1 (guarded blocks reopened) | 0 = count only; 1 = blocks and texture slots; slots = texture slots only; all = everything; guards/unset/other = blocks only |
 | `VICTORY_PAIRS` | In the offline shader translation walk, keeps the named vertex+pixel shader pairs (label substrings) so their pipelines are built afterwards. | none | comma-separated vs+ps pairs of label substrings |
+| `VICTORY_PAIR_CHEAP` | Pair meetings of 32-lane host waves meet once per exchange (two buffers) and read their counter with one fenced load. Changes translations. | on | 0 = two meetings and an atomic per lane per read, as before; anything else = on |
+| `VICTORY_PAIR_LDS_ORDER` | No pair meeting around LDS accesses whose order does not matter. Changes translations. | on | 0 = a meeting before every LDS access, as before; anything else = on |
+| `VICTORY_PAIR_REGIONS` | With pair meetings, loop branches get their own lane region, and title barriers inside wave-wide branches become fences only when `VICTORY_GROUP_SYNC=1` (otherwise they still wait for the group). Changes translations. | on | 0 = as before; anything else = on |
 | `VICTORY_PANEL` | Draws the run's numbers as white text on a black box in the picture's upper-left corner; F3 shows or hides it. *Diagnostics build only.* | off | 0 or unset = off; anything else = on (F3 shows/hides) |
 | `VICTORY_PATCH_CLZERO` | Replaces each faulting cache-zeroing loop in the title's code with plain stores the first time it faults, so it stops raising exceptions. | on | 0 = off; anything else = on |
 | `VICTORY_PATCH_WAITS` | Replaces the title's console wait instructions (monitorx/mwaitx) with harmless ones the first time they fault, instead of emulating them each time. | on | 0 = off; anything else = on |
@@ -259,9 +265,13 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_PORT_DESCRIPTORS` | Learns which descriptor slots the title wrote from its patched stores, instead of looking at every changed heap page each frame. | off | 1 = on; unset/anything else = off |
 | `VICTORY_PORT_DESCRIPTORS_CHECK` | Sets how many heap pages the fallback checks per frame when descriptor porting is on. | 16 | &lt;pages per frame, integer>; 0 = none |
 | `VICTORY_PORT_DESCRIPTORS_EVERY` | Sets how many frames pass between the fallback's questions to the write watch when descriptor porting is on. | 8 | &lt;frames, integer, minimum 1> |
+| `VICTORY_PRELUDE_UPLOADS` | Decides title texture uploads at submission, after the check, and copies them on the list's prelude. | off | 1 = on; unset/other = off |
 | `VICTORY_PROBE` | Test tool: runs each .dxil file in the folder on the card and prints what the host's compiler made of it. | not set (test only) | &lt;folder of .dxil files> |
 | `VICTORY_PROCESS_PRIORITY` | Stops the process from raising itself to above-normal priority. | above normal priority | normal or 0 = leave priority as started; anything else = above normal |
 | `VICTORY_PROFILE` | Samples the busiest threads' stacks at an interval during a time window and writes where the process's time goes to a file. *Diagnostics build only.* | off | &lt;from>,&lt;to>,&lt;ms>,&lt;file>: seconds window, sample interval in milliseconds, output file |
+| `VICTORY_QUEUE_BATCH` | The texture pass tells the texture queue what came of its slots 16 at a time and takes slot state with the slots due. | on | 0 = one take of the queue's lock per slot, as before; anything else = on |
+| `VICTORY_QUEUE_HOST_TEXTURES` | Queues records of textures the host writes for the texture pass. | on | 0 = leave them out of the queue; anything else = on |
+| `VICTORY_QUEUE_MARKS` | The texture queue's marks let notes that change nothing skip its lock. | on | 0 = the earlier take-out skip only (and `VICTORY_TABLED_REREAD` does nothing); anything else = on |
 | `VICTORY_QUEUE_WAIT` | Makes queues honour fence waits; when off every submission runs as soon as it is made. | on | 0 = off; anything else = on |
 | `VICTORY_QUICK_FIND` | Keeps a per-thread cache of the last copy found for an address, avoiding the shared map's lock. | on | 0 = off; anything else = on |
 | `VICTORY_QUICK_MIRROR` | Tells a slot already made from its record so without taking the heap lock. | on | 0 = off; anything else = on |
@@ -342,11 +352,13 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_SWEEP_PER_HEAP` | Runs the heap buffer pass once per bound view heap each frame instead of once for all heaps. | off | 1 = on; unset/other = off |
 | `VICTORY_SYNC_FINE` | Hands each thread fewer descriptor pages and records at a time when syncing heaps, so the work spreads across more threads. | off | any value except 0 = on; 0/unset = off |
 | `VICTORY_SYNC_IN_PLACE` | Reads a changed descriptor page's records in place and compares each with the last seen, instead of copying the page first. | on | 0 = off; anything else = on |
+| `VICTORY_TABLED_REREAD` | A later table read in the same frame takes out a slot written after the frame's first read. | off | 1 = on; unset/other = off |
 | `VICTORY_TABLED_TEXTURES` | Keeps textures that draws read through tables in the queue of textures picked by index, as before. | off (tabled slots leave the queue) | 1 = keep them in the queue as before; unset/other = leave the queue |
 | `VICTORY_TAKE_PARTS` | When a write-watched page was taken before, copies only the parts written since where known, not the whole page. | on | 0 = off; anything else = on |
 | `VICTORY_TARGET_VARIANTS` | Gives a draw into views of other formats than its pipeline declares a host pipeline built for those formats. | on | 0 = off; anything else = on |
 | `VICTORY_TEST_ROUNDS` | Sets how many rounds a landing stress unit test runs. | 120 (tests only) | &lt;number of rounds, integer> |
 | `VICTORY_TEST_TITLES` | Lists folders or files of real title data for tests that need them; those tests skip when it is unset. | none (tests needing game files skip) | &lt;paths separated by the OS path separator (; on Windows)> |
+| `VICTORY_TEXBACK_ASYNC` | Writes texture read-backs into title memory on a thread of their own. | on | 0 = written on the landing thread, as before; anything else = on |
 | `VICTORY_TEXTURE_AWAY_MS` | Waits this long before a texture slot whose memory is unmapped goes null, so surfaces do not flash black. | 3000 | &lt;milliseconds, integer>; 0 = at once |
 | `VICTORY_TEXTURE_BACK` | Picks which shader-written texture kinds are copied back to title memory so the title's CPU can read them (the ocean maps). | the four water kinds (256x256f41, 256x256f16, 64x64f16, 128x128f36) | 1 = default kinds; 0 = none; &lt;WxHf&lt;format number>,... list of kinds> |
 | `VICTORY_TEXTURE_BUDGET_MB` | Caps the bytes of host copies of title-filled textures made for index-picked shaders. | none (share of the card's budget; 4 GB without a budget) | &lt;megabytes, integer> = cap on bytes of host texture copies |
@@ -360,7 +372,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_TEXTURE_NO_WAIT` | Lets a texture refresh continue without waiting while the runtime is remapping title memory. *Set by `scripts\play.ps1`.* | off | 1 = on; unset/other = off |
 | `VICTORY_TEXTURE_ONCE` | Fills a staging buffer made for a single texture upload without consulting the write watch and guards. | on | 0 = off; anything else = on |
 | `VICTORY_TEXTURE_POOL` | Makes blocks for textures ahead of time from a pool, so one is ready when a texture needs memory. | on | 0 = off; anything else = on |
-| `VICTORY_TEXTURE_ROOM_PERCENT` | Sets the share of the card's budget up to which host copies of index-picked textures are made. | 90 | &lt;percent, integer>; clamped to 50-97 |
+| `VICTORY_TEXTURE_ROOM_PERCENT` | Sets the share of the card's budget up to which host copies of index-picked textures are made; unset, the line is the budget less max(768 MiB, 5 %), never under 90 %. | not set (about 93 % on a 12 GB card) | &lt;percent, integer>, clamped to 50-97; 90 = the line as before |
 | `VICTORY_TEXTURE_SAME` | Skips an upload when title memory holds the same bytes the host texture copy was already filled from. | on | 0 = off; anything else = on |
 | `VICTORY_TEXTURE_STAGE_MB` | Sets how many megabytes of index-picked textures are made and staged per frame pass. | not set (computed from the card's room) | &lt;megabytes per frame pass, integer> |
 | `VICTORY_TEXTURE_STAGE_MS` | Sets the time limit per frame pass for making and staging index-picked textures. | 250 | &lt;milliseconds per pass, integer> |
@@ -415,6 +427,10 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_WAVE_OWN_BITS` | Accepts a wave OR where not every lane runs, where the lanes' own bits can be told apart. | on | 0 = off; anything else = on |
 | `VICTORY_WAVE_WHY` | Prints why a wave64 region was refused translation, by its LDS accesses. | off | any value = on |
 | `VICTORY_WAVE_WIDE` | Translates console wave64 programs as two host waves (wide form); unset widens only one narrow case. | unset: only one narrow case is widened | 1 = wide form on; 0 = never wide; unset = narrow case only |
+| `VICTORY_WAVE_WIDE_VOLUMETRIC` | The volumetric light's two tiled programs take the wave-wide form before any approximate one. Changes translations. | off | 1 = on (ignored while `VICTORY_WAVE_WIDE` is set); unset/other = off |
+| `VICTORY_WC_BAR` | Gives a write-combined title buffer one copy in card memory the CPU maps. | off | 1 = on; unset/other = off |
+| `VICTORY_WC_NO_BACK` | Leaves what shaders write in card copies of write-combined title memory on the card (no compare, fetch or merge back). | off | 1 = on; unset/other = off |
+| `VICTORY_WC_NO_BACK_MIN_KB` | The smallest copy `VICTORY_WC_NO_BACK` and `VICTORY_WC_BAR` apply to (smaller ones went near black in cutscenes). | 1024 | &lt;KiB, integer>; 0 = every copy |
 | `VICTORY_WIDE_BACK` | Takes snapshots of shader-written ranges and compares them across several threads, one range per thread. *Set by `scripts\play.ps1`.* | on | 0 = off; anything else = on |
 | `VICTORY_WIDE_FILLS` | Does a submission's upload memory fills together on several threads. | on (needs WIDE_REFRESH on) | 0 = off; anything else = on |
 | `VICTORY_WIDE_MERGE` | Merges shader writes to card copies into title memory on several threads. | off | 1 = on; unset/other = off |

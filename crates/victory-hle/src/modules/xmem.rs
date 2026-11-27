@@ -180,6 +180,12 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // Write-combined: memory the title's CPU writes and does not read
+    // (`VICTORY_WC_NO_BACK`, `VICTORY_WC_BAR` in victory-gpu).
+    // (From VIctory-NVIDIA 50c15a1, readmet3xt-lab.)
+    if !at.is_null() && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }

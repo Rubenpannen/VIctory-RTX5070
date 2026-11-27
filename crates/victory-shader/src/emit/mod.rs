@@ -552,7 +552,26 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
-        let wide_on = wide_option.as_ref().is_some_and(|v| v == "1");
+        // With `VICTORY_WAVE_WIDE_VOLUMETRIC=1`, two programs take this form all the same,
+        // before any approximate one: the
+        // volumetric light's tiled programs (`CS_TransmissionVolumetrics_Tiled` and
+        // `_Tiled_LocalLights`): groups of 64 (one console wave), an LDS read
+        // and write in one lane-branch region. Widened they translate (4 and 7 branches taken
+        // wave-wide); VIctory-NVIDIA found no other form that did, their dispatches dropped
+        // and no volumetric light or fog on NVIDIA. (Without this, here the approximate local
+        // waves or the last resort below may take them; `VICTORY_WAVE_WHY` tells which.)
+        // Off by default until a run here has shown which form they take now (`VICTORY_WAVE_WHY`);
+        // not with `VICTORY_WAVE_WIDE` set either way.
+        // (From VIctory-NVIDIA eeb17cc, readmet3xt-lab.)
+        let volumetric = wide_option.is_none()
+            && std::env::var_os("VICTORY_WAVE_WIDE_VOLUMETRIC").is_some_and(|v| v == "1")
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                    | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+            );
+        let wide_on = wide_option.as_ref().is_some_and(|v| v == "1") || volumetric;
         // Unset, one narrower case is widened all the same: a console compute program
         // (`ACCC`) refused only because a lane mask is exchanged where not every lane runs,
         // inside a loop that runs until every lane is done (a single backward latch on the
@@ -740,6 +759,9 @@ fn widen(
         }
         _ => return Err(NOT),
     }
+    // (pair meetings only where a group holds several console waves: one console wave meets
+    // at group barriers, and its translation stays as it was)
+    let pairs = pairs && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
@@ -763,7 +785,9 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
+        // (with pair meetings, the lane regions they see: [`lower::with_pair_meetings`])
+        let around = || lower::branches_around(&st, &needs);
+        let more: Vec<usize> = if pairs { lower::with_pair_meetings(around) } else { around() }
             .unwrap_or_default()
             .into_iter()
             .filter(|b| !wide.contains(b))

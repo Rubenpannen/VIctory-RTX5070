@@ -95,6 +95,10 @@ const KEYED: &[&str] = &[
     "VICTORY_LDS_INIT_HOIST",
     "VICTORY_THREAD_TICKET",
     "VICTORY_MESH_LAUNCH",
+    "VICTORY_PAIR_REGIONS",
+    "VICTORY_PAIR_LDS_ORDER",
+    "VICTORY_PAIR_CHEAP",
+    "VICTORY_WAVE_WIDE_VOLUMETRIC",
 ];
 
 /// Since the start: entries of an earlier build of the translator met,

@@ -856,6 +856,28 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             }
         }
     }
+    // With `VICTORY_PRELUDE_UPLOADS=1`: whether to upload is decided when
+    // the list is submitted, after the check that refreshes the staging
+    // buffer, and the copy goes on the list's prelude ([`PreludeUpload`]).
+    // Not for a bake's (`BAKING`: in the list, as before), nor for a host
+    // copy with levels from the store still to copy in first
+    // (`crate::texstore`'s prefill, on this list below).
+    // (From VIctory-NVIDIA 91df493, readmet3xt-lab.)
+    if prelude_uploads()
+        && !BAKING.get()
+        && copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    {
+        if no_wait() && fill_unlocked() {
+            let there = match picking {
+                Some(there) if there != u64::MAX => there,
+                _ => mapped_bytes(staging.memory, staging.read),
+            };
+            staging.expected.store(there, Relaxed);
+        }
+        let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+        list.defer_prelude_upload(PreludeUpload { staging, copy, on_demand });
+        return;
+    }
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
@@ -1006,6 +1028,138 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             crate::descriptor::host::levels_waiting(staging.memory as u64);
         }
     });
+}
+
+/// Whether title textures that lists sample are uploaded on each list's
+/// prelude at submission, when the check that refreshes the staging buffer
+/// has run, if it changed or was never uploaded (`VICTORY_PRELUDE_UPLOADS=1`;
+/// off: the list records the upload when it samples the texture, if the
+/// staging buffer was changed then, as before; bakes and host copies with
+/// a texture store prefill pending keep that either way).
+///
+/// Ported from Belobug/VIctory-Belobug-AMD 5d6bd84 ("Upload title textures
+/// in submission prelude to fix frame-order & flickering"), where it is the
+/// only way. Recorded when the list samples a texture, an upload is left out
+/// if the staging buffer held what the host copy holds at that moment; the
+/// check at submission may then find the memory changed and detile it, and
+/// only the next list that samples the texture uploads that: a frame late
+/// when every list of the frame was recorded before the check (a ring of
+/// video buffers then shows an old picture, a texture streamed in shows the
+/// last one for a frame). Decided at submission, the copy takes what the
+/// check found, in the submission that samples it. A candidate of the
+/// flicker at scene loads (analysis 6.12). (From VIctory-NVIDIA 91df493,
+/// readmet3xt-lab.)
+pub(crate) fn prelude_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_UPLOADS").is_some_and(|v| v == "1"))
+}
+
+/// Whether the prelude of the list being submitted records the upload into
+/// a host texture ([`PreludeUpload::finish_refresh`]): `Some(first upload)`
+/// when it was never uploaded or its staging buffer was detiled since the
+/// last upload; `None` when the host texture holds what the staging buffer
+/// holds. (Ported from Belobug/VIctory-Belobug-AMD 5d6bd84.)
+fn claim_upload(uploaded: &std::sync::atomic::AtomicBool, dirty: &std::sync::atomic::AtomicBool) -> Option<bool> {
+    use std::sync::atomic::Ordering::AcqRel;
+    let was_uploaded = uploaded.swap(true, AcqRel);
+    let was_dirty = dirty.swap(false, AcqRel);
+    (!was_uploaded || was_dirty).then_some(!was_uploaded)
+}
+
+/// A title texture a list samples, its upload decided at the list's
+/// submission ([`prelude_uploads`]): its staging buffer, its host copy (both
+/// held by the list until it is reset), and its levels on demand. (Ported
+/// from Belobug/VIctory-Belobug-AMD 5d6bd84 by VIctory-NVIDIA 91df493; a
+/// host copy with a texture store prefill still to copy in is uploaded in
+/// the list as before, see [`upload_from`].)
+#[derive(Clone)]
+pub(crate) struct PreludeUpload {
+    staging: Arc<Staging>,
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+    on_demand: Option<crate::resource::OnDemand>,
+}
+
+impl PreludeUpload {
+    /// The staging buffer, for the submission's check (`Step::Texture`).
+    pub(crate) fn staging(&self) -> Arc<Staging> {
+        self.staging.clone()
+    }
+
+    /// Whether the host copy is cut from a block ([`in_block`]): only such a
+    /// one takes the aliasing barrier before its first upload (the host
+    /// refuses to close a list with one on a committed texture).
+    pub(crate) fn in_block(&self) -> bool {
+        in_block(&self.copy.texture)
+    }
+
+    /// On the submitting thread, once the check that refreshes the staging
+    /// buffer has run for this submission: `Some(first upload)` if the
+    /// list's prelude records the copy into the host texture, with what the
+    /// list's own upload noted when it was recorded (a host copy grown, the
+    /// levels on demand given memory, what the host copy holds).
+    pub(crate) fn finish_refresh(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+            return None;
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        // A host copy that took the place of one with fewer levels: the slots
+        // that show that one are made again once this upload has run.
+        if self.staging.first == self.staging.level0 && self.copy.grown.swap(false, Relaxed) {
+            crate::descriptor::host::levels_changed_after(self.staging.memory as u64);
+        }
+        // Levels on demand (`crate::tiles`): the held levels the staging
+        // buffer holds as the title's are given the card's memory before the
+        // prelude copies into them; else what the host copy now holds is
+        // noted.
+        match &self.on_demand {
+            Some(on_demand) => {
+                let waiting = on_demand.uploaded(self.staging.detiled.load(Relaxed), self.staging.memory as u64);
+                self.staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
+                // A texture picked by index has no staging buffer after this
+                // upload: its slots are made due again by the texture pass.
+                if waiting {
+                    crate::descriptor::host::levels_waiting(self.staging.memory as u64);
+                }
+            }
+            None => self.staging.note_held(),
+        }
+        Some(first_upload)
+    }
+
+    /// Records the copy of the staging buffer into the host texture on
+    /// `list` (the prelude), the host texture in the copy destination state.
+    pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
+        let texture = &self.copy.texture;
+        // The staging buffer lives as long as `self.staging`, which the
+        // list's steps hold until it is reset.
+        for (i, footprint) in self.staging.footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: self.staging.first - self.staging.level0 + i as u32,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&self.staging.buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: self.staging.base + footprint.Offset,
+                        ..*footprint
+                    },
+                },
+            };
+            // SAFETY: an open list; both locations name live resources.
+            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+    }
 }
 
 /// Records copies of levels `0..levels` of `copy` (in the copy destination
@@ -2234,6 +2388,62 @@ mod title_memory_tests {
     }
 }
 
+/// [`claim_upload`] (ported from Belobug/VIctory-Belobug-AMD 5d6bd84).
+#[cfg(test)]
+mod prelude_upload_tests {
+    use super::claim_upload;
+    use std::sync::atomic::{AtomicBool, Ordering::Release};
+
+    /// The first upload is claimed, a second list of the submission skips,
+    /// an unchanged texture skips, a changed one is claimed in the same
+    /// submission, every time it changes.
+    #[test]
+    fn first_upload_clean_skip_and_immediate_same_frame_reupload() {
+        let uploaded = AtomicBool::new(false);
+        let dirty = AtomicBool::new(true);
+        assert_eq!(claim_upload(&uploaded, &dirty), Some(true));
+        assert_eq!(claim_upload(&uploaded, &dirty), None);
+        assert_eq!(claim_upload(&uploaded, &dirty), None);
+        dirty.store(true, Release);
+        assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
+        dirty.store(true, Release);
+        assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
+    }
+
+    /// A ring of three buffers written in turn (a video's) never shows a
+    /// picture older than the one its buffer holds, a held picture
+    /// included.
+    #[test]
+    fn three_buffer_ring_never_displays_stale_frame() {
+        let ring: [(AtomicBool, AtomicBool); 3] = std::array::from_fn(|_| (AtomicBool::new(false), AtomicBool::new(true)));
+        let mut shown = [0u32; 3];
+        let schedule = [
+            (0, 1, true),
+            (1, 2, true),
+            (2, 3, true),
+            (0, 4, true),
+            (1, 5, true),
+            (1, 5, false),
+            (2, 6, true),
+            (0, 7, true),
+            (1, 8, true),
+            (2, 9, true),
+            (0, 10, true),
+            (1, 11, true),
+        ];
+        for (slot, picture, changed) in schedule {
+            let (uploaded, dirty) = &ring[slot];
+            if changed {
+                dirty.store(true, Release);
+            }
+            if claim_upload(uploaded, dirty).is_some() {
+                shown[slot] = picture;
+            }
+            assert_eq!(shown[slot], picture, "slot {slot} shows picture {} instead of {picture}", shown[slot]);
+        }
+    }
+}
+
 /// How long this PC's card takes to make the allocations a staged texture needs, for
 /// `cargo test -p victory-gpu allocation_costs -- --ignored --nocapture`.
 #[cfg(test)]
@@ -2322,6 +2532,51 @@ mod allocation_costs {
                 println!("{name}, {how}: {:.1} us a look", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
             }
             crate::inplace::views_gone(noted, blocks * BLOCK);
+        }
+    }
+
+    /// What the pass over textures picked by index pays per slot outside its
+    /// timed parts (2026-11-26): asking whether a staged texture's memory is
+    /// all there (`staged(_, true)`, a question per 256 pages), and the
+    /// fingerprint of 48 KiB made after each upload and each texture found
+    /// the same. For `cargo test -p victory-gpu --release --lib pass_costs --
+    /// --ignored --nocapture`. (From VIctory-NVIDIA 0b651fa, readmet3xt-lab.)
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn pass_costs() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        for mb in [1usize, 4, 16] {
+            let len = mb << 20;
+            // SAFETY: memory of our own, committed and touched.
+            let at = unsafe {
+                let at = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                std::ptr::write_bytes(at.cast::<u8>(), 1, len);
+                at as usize
+            };
+            const N: u32 = 200;
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                assert!(super::committed(at as *const u8, len));
+            }
+            println!("{mb} MB, all in the working set: whether it is all there, {:.1} us", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
+            // Pages out of the working set (trimmed, as Windows does to a
+            // process under pressure) are asked again by a read of a byte.
+            let mut worst = 0f64;
+            for _ in 0..5 {
+                // SAFETY: our own process.
+                unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+                let began = std::time::Instant::now();
+                assert!(super::committed(at as *const u8, len));
+                worst = worst.max(began.elapsed().as_secs_f64() * 1e6);
+            }
+            println!("{mb} MB, just trimmed from the working set: {worst:.1} us");
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(super::fingerprint(at as u64, len as u64));
+            }
+            println!("{mb} MB: a fingerprint, {:.1} us", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
         }
     }
 

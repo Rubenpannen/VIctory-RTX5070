@@ -2938,6 +2938,20 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // Write-combined regions there (from VIctory-NVIDIA 50c15a1,
+    // readmet3xt-lab) and texture read-backs still waiting to be written
+    // there (`VICTORY_TEXBACK_ASYNC`: the title was told the card is done
+    // before they land, so it may free the memory first) go with it. With no
+    // length, all of the allocation: regions committed inside a reservation
+    // begin after its start. (Before the guards: a read-back being written
+    // holds the tickets' lock, which `crate::texback::remapped` waits for.)
+    if crate::texback::tracking() || crate::shadow::any_write_combined() {
+        let end = if len != 0 { at.saturating_add(len) } else { allocation_end(at, at) };
+        // (0: the allocation's end not found; regions beginning at `at` go.)
+        let whole = end.saturating_sub(at);
+        crate::texback::remapped(at, whole);
+        crate::shadow::write_combined_freed(at, whole);
+    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];

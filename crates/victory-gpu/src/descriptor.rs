@@ -13,6 +13,66 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+thread_local! {
+    /// Set while this thread runs the pass over textures picked by index
+    /// (`crate::draw::State::heap_textures`): its waits for the locks below
+    /// are counted apart from other threads' ([`LOCK_WAITS`]). (From
+    /// VIctory-NVIDIA 0b651fa, readmet3xt-lab.)
+    pub(crate) static IN_TEXTURE_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Nanoseconds threads waited for a lock another thread held, since the
+/// last 5-second line: the queue of textures picked by index's
+/// (`host::TextureQueue`) by the texture pass's thread and by the others
+/// (the threads that note slot writes in it), then the table of views'
+/// ([`VIEWS`]) likewise. Only waits are counted: a lock taken at once costs
+/// nothing here (`try_lock` first). (From VIctory-NVIDIA 0b651fa,
+/// readmet3xt-lab.)
+pub(crate) static LOCK_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A wait for lock `which` (0: the texture queue's, 1: the views table's)
+/// that began at `started` is over: counted in [`LOCK_WAITS`]. Returns its
+/// nanoseconds.
+pub(crate) fn waited(which: usize, started: std::time::Instant) -> u64 {
+    let other = usize::from(!IN_TEXTURE_PASS.get());
+    let ns = started.elapsed().as_nanos() as u64;
+    LOCK_WAITS[2 * which + other].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    ns
+}
+
+/// The places that take the lock of the queue of textures picked by index
+/// (`host::TextureQueue`), counted apart in [`QUEUE_LOCK`]. (From
+/// VIctory-NVIDIA 4cee21f, readmet3xt-lab.)
+pub(crate) mod queue_site {
+    /// The pass asks what is known of a slot, or tells what came of it.
+    pub(crate) const TELL: usize = 0;
+    /// The pass takes the slots due and the queue's counts.
+    pub(crate) const DUE: usize = 1;
+    /// Slots made due by memory mapped, unmapped or written, by room on
+    /// the card again, by levels waiting for it.
+    pub(crate) const MADE_DUE: usize = 2;
+    /// A slot's record made, copied in or made by a draw or the pass: the
+    /// slot queued, kept, or taken out.
+    pub(crate) const WRITE: usize = 3;
+    /// A draw read the slot through a table: taken out.
+    pub(crate) const TABLE: usize = 4;
+    /// Slots made stale by a newer view of other memory: taken out.
+    pub(crate) const STALE: usize = 5;
+    /// Anything else (counts for the lines, the bakes' news).
+    pub(crate) const OTHER: usize = 6;
+    pub(crate) const COUNT: usize = 7;
+}
+
+/// Since the last 5-second line, by [`queue_site`]: the times the texture
+/// queue's lock was taken; the nanoseconds threads waited for it; the
+/// nanoseconds it was held by the places that hold it for many slots at a
+/// time (the slots due, slots made due, stale views); and the times it was
+/// not taken because what was asked would have changed nothing (the
+/// queue's marks, `host::Queued`). (From VIctory-NVIDIA 4cee21f,
+/// readmet3xt-lab.)
+pub(crate) static QUEUE_LOCK: [[std::sync::atomic::AtomicU64; queue_site::COUNT]; 4] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; queue_site::COUNT] }; 4];
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -1303,12 +1363,32 @@ fn words_for(view: View) -> [u32; 2] {
     views_write().entry(view)
 }
 
+/// (A wait for the lock is counted, [`LOCK_WAITS`]: from VIctory-NVIDIA
+/// 0b651fa, readmet3xt-lab; as in [`views_write`].)
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    match VIEWS.try_read() {
+        Ok(views) => views,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            waited(1, started);
+            views
+        }
+    }
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    match VIEWS.try_write() {
+        Ok(views) => views,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            waited(1, started);
+            views
+        }
+    }
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
