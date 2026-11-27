@@ -634,7 +634,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, !wide_on);
+                        let again = widen(c, native, base, why, !wide_on, false);
                         report(if wide_on { "wave-wide branches" } else { "wave-wide active-lane loop" }, &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -691,16 +691,19 @@ pub fn emit(
         // all, the per-lane branches taken wave-wide ([`widen`]) even with `VICTORY_WAVE_WIDE`
         // unset: groups of one console wave whose shared memory is read and written where not
         // every lane runs (counters set by one lane, then `ds_min`/`ds_max`/`ds_add` by the
-        // others, then read; no barrier, the console wave runs in step). Seven programs of
-        // the RTX 5070's runs on 2026-11-26 came here; four are groups of one console wave.
-        // No program that translated otherwise is touched (those of runs 121-124 among them).
-        // `VICTORY_WAVE_WIDE=0`: not, as before.
+        // others, then read; no barrier, the console wave runs in step). Groups of several
+        // console waves too, whose host waves then meet in pairs, each console wave's two
+        // alone ([`lower::with_pair_meetings`]): the VFX heaps' defragmentation and the
+        // projected-decal trails (`CS_DefragHeap_ComputeRelocations`, a loop in which thread
+        // 63 moves a counter and `v_readlane ..., 63` carries the wave's state to the next
+        // round; four programs). No program that translated otherwise is touched (those of
+        // runs 121-124 among them). `VICTORY_WAVE_WIDE=0`: not, as before.
         if !wide_on && wide_option.as_ref().is_none_or(|v| v != "0") {
             let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
             let deep = if deep_on { form(ir::without_skips(p, true)).map(|f| f.0) } else { None };
             let bases = [deep.as_ref(), forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
             if let Some(base) = bases.into_iter().flatten().next() {
-                let again = widen(c, native, base, why, false);
+                let again = widen(c, native, base, why, false, true);
                 report("wave-wide branches (last resort)", &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
@@ -717,7 +720,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -746,16 +749,19 @@ pub fn emit(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come. `active_loop_only`: nothing but one
-/// loop that runs until every lane is done is widened, or it gives up.
+/// it translates or a branch cannot be widened. Where a thread group is one console wave; with
+/// several, the waves of a group would decide differently and a barrier inside such a branch
+/// would wait for threads that never come, so only with `pairs`: the two host waves of a
+/// console wave then meet each other alone ([`lower::with_pair_meetings`]).
+/// `active_loop_only`: nothing but one loop that runs until every lane is done is widened, or
+/// it gives up.
 fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
     active_loop_only: bool,
+    pairs: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -765,6 +771,7 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(_) if pairs => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -779,7 +786,11 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = if pairs {
+            lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            emit_program(c, native, p, &st, &io, &res)
+        };
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)

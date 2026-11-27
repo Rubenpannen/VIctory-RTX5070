@@ -182,6 +182,8 @@ struct Block {
     phis: Vec<u32>,
     body: Vec<u32>,
     term: Option<Term>,
+    /// The block the code written here goes on in ([`Module::continue_in`]).
+    continued: Option<usize>,
 }
 
 /// Function attributes of a `dx.op` declaration.
@@ -409,11 +411,59 @@ impl Module {
     }
 
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let block = self.end_of(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
         self.blocks[block].body.push(i);
         V::Inst(i)
+    }
+
+    /// The code written in `block`, which is ended, goes on in `next` (a meeting of two host
+    /// waves, a loop that waits, came in between): what is written to `block` from now on,
+    /// its terminator among it, goes to the end of that chain, and a phi whose edge names
+    /// `block` takes the block of the chain that branches to it ([`Self::settle`]). Callers
+    /// that hold a block across code that may meet need not know.
+    pub fn continue_in(&mut self, block: usize, next: usize) {
+        self.blocks[block].continued = Some(next);
+    }
+
+    /// Where code written to `block` goes ([`Self::continue_in`]).
+    pub fn end_of(&self, mut block: usize) -> usize {
+        while let Some(next) = self.blocks[block].continued {
+            block = next;
+        }
+        block
+    }
+
+    /// Each phi edge from a block that was continued names the block of its chain that
+    /// branches to the phi's block. Before writing.
+    pub fn settle(&mut self) {
+        if self.blocks.iter().all(|b| b.continued.is_none()) {
+            return;
+        }
+        for to in 0..self.blocks.len() {
+            for k in 0..self.blocks[to].phis.len() {
+                let i = self.blocks[to].phis[k] as usize;
+                let Op::Phi(incoming) = &self.insts[i].op else { continue };
+                let incoming: Vec<(V, usize)> = incoming
+                    .iter()
+                    .map(|&(v, from)| {
+                        let mut b = from;
+                        loop {
+                            if successors(self.blocks[b].term).contains(&to) {
+                                return (v, b);
+                            }
+                            match self.blocks[b].continued {
+                                Some(next) => b = next,
+                                None => return (v, from),
+                            }
+                        }
+                    })
+                    .collect();
+                self.insts[i].op = Op::Phi(incoming);
+            }
+        }
     }
 
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
@@ -497,6 +547,7 @@ impl Module {
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.end_of(block);
         self.blocks[block].term = Some(t);
     }
 

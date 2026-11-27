@@ -773,6 +773,110 @@ fn a_branch_that_adds_to_one_lds_dword_and_reads_another_needs_no_meeting_inside
     eprintln!("ran on the hardware device: the sum over every thread taking part in every case");
 }
 
+/// `p` (of `native`) lowered for a host of 32-lane waves with pair meetings
+/// ([`lower::with_pair_meetings`]), the branches around the places the two host waves of a
+/// console wave must meet taken wave-wide until it gives waves of 32, as `super::widen` does
+/// for groups of several console waves; its DXIL is validated where `dxil.dll` is found.
+fn widened_with_pairs(native: &NativeProgram, p: &ir::Program) -> HostShader {
+    let mut wide: HashSet<usize> = HashSet::new();
+    for _ in 0..16 {
+        let st = structure::structure_wide(p, &wide).expect("structure");
+        let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(p, native).expect("io::raise");
+        lower::take_needs();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = lower::with_pair_meetings(|| {
+            lower::lower_counted(
+                &lower::Parts {
+                    native,
+                    p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    prims: Vec::new(),
+                    mesh_stride: 0,
+                },
+                false,
+            )
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        let needs = lower::take_needs();
+        if let Ok(mut l) = lowered
+            && l.wave_size != Some(64)
+        {
+            assert_eq!(l.wave_size, Some(32));
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                v.validate(&mut l.dxil).expect("DXIL validation failed");
+            }
+            let was = lower::TEST_HOST_WAVE.replace(Some(32));
+            let shader = lower::with_pair_meetings(|| lowered_on(native, p, &wide, 32));
+            lower::TEST_HOST_WAVE.set(was);
+            return shader.expect("lower");
+        }
+        let more: Vec<usize> = lower::branches_around(&st, &needs)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| !wide.contains(b))
+            .collect();
+        assert!(!more.is_empty(), "no branch left to widen (needs {needs:?})");
+        wide.extend(more);
+    }
+    panic!("not widened in 16 rounds");
+}
+
+/// A group of two console waves (128 threads) in which each console wave goes round a scalar
+/// loop its own number of times (wave 0 once, wave 1 twice: `readfirstlane(thread) >> 6`,
+/// plus one), and in each round its lanes below s0 take a wave-wide OR of `1 << (lane >> 1)`
+/// (`v_readlane ..., 32`: the two halves of the console wave exchange) inside their branch
+/// and add it up. Every thread stores its sum at its own dword. Run as host waves of 32, the
+/// halves of each console wave meet each other alone (pair meetings): with group barriers
+/// console wave 1's second round would wait for console wave 0, which has left the loop.
+#[test]
+fn console_waves_of_one_group_that_go_round_a_loop_differently_meet_their_own_halves() {
+    let mut words = vec![
+        0x3610_00BF, // v_and_b32 v8, 63, v0 (the console lane)
+        0x2C0C_1081, // v_lshrrev_b32 v6, 1, v8
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0x7E28_0500, // v_readfirstlane_b32 s20, v0
+        0x9014_8614, // s_lshr_b32 s20, s20, 6 (the console wave)
+        0x8014_8114, // s_add_u32 s20, s20, 1 (its rounds)
+        // the loop
+        0x7D88_1000, // v_cmp_gt_u32 vcc, s0, v8
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0015, // s_cbranch_execz past the OR and the add
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x4A12_1207, // v_add_nc_u32 v9, s7, v9
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x8094_8114, // s_sub_u32 s20, s20, 1
+        0xBF07_8014, // s_cmp_lg_u32 s20, 0
+        0xBF85_FFE4, // s_cbranch_scc1 the loop
+        0x3414_0082, // v_lshlrev_b32 v10, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 9 << 8 | 10, // buffer_store_dword v9, v10, s[8:11], 0 offen
+    ]);
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = widened_with_pairs(&native, &p);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for below in [64u32, 40, 33, 32, 10, 1, 0] {
+        let Some(out) = whole_uav(&shader, [below, 0], 128) else { return };
+        // the OR over the lanes below s0 of 1 << (lane >> 1)
+        let or = if below == 0 { 0 } else { ((1u64 << ((below - 1) / 2 + 1)) - 1) as u32 };
+        for (t, &got) in out.iter().enumerate() {
+            let (wave, lane) = (t as u32 / 64, t as u32 % 64);
+            let expected = if lane < below { or.wrapping_mul(wave + 1) } else { 0 };
+            assert_eq!(got, expected, "s0 = {below}, thread {t}");
+        }
+    }
+    eprintln!("ran on the hardware device: each console wave's own rounds, in every case");
+}
+
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
@@ -785,9 +889,12 @@ fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Ve
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
     };
-    let Ok((root, pso)) = host.compute_pipeline(shader) else {
-        eprintln!("the hardware device does not take this program; not run");
-        return None;
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program ({e}); not run");
+            return None;
+        }
     };
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
