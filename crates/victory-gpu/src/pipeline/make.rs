@@ -51,6 +51,62 @@ pub(crate) struct Pending {
     /// ([`for_formats`]): a chain from the title's pipeline, one link per
     /// set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
+    /// Why it is left out on purpose ([`left_out`]): never queued nor made,
+    /// and its draws and dispatches are dropped.
+    left_out: Option<&'static str>,
+    /// How long draws and dispatches have waited for it so far, in
+    /// microseconds ([`wait_once`]).
+    waited_us: AtomicU64,
+}
+
+/// Whether one of `shaders` is a compute program whose container names
+/// `name` (its entry point, in the container's debug name).
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// Whether the ray-tracing passes are left out ([`left_out`]): only while the
+/// structure builder is off (`VICTORY_BVH_BUILDER` not `1`). On by default;
+/// `VICTORY_RT_LEAVE_OUT=0` makes them as before.
+fn rays_left_out() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        !builder && std::env::var_os("VICTORY_RT_LEAVE_OUT").is_none_or(|v| v != "0")
+    })
+}
+
+/// Why a pipeline of `shaders` is left out on purpose, if it is: never
+/// queued, never made, and every draw or dispatch with it dropped (counted
+/// as such, [`take_left_out`], not as "being made").
+///
+/// - A shader named in `VICTORY_SKIP_PIPELINES` (16-digit hashes; in every
+///   build: before, the diagnostics build only dropped its draws and still
+///   made its pipeline).
+/// - shortcut: without the structure builder, the ray-tracing passes:
+///   `CS_RaytracingResolve` (some 1,000 programs, one indirect dispatch per
+///   material, about 630 a frame in gameplay) and
+///   `CS_ScreenProbes_ActivateRays`. With no structures to walk they shade
+///   no hits, while at the intro's first frame they crowd the cold queue
+///   and each of their dispatches took from the dispatches' wait budget
+///   (from VIctory-NVIDIA 3bcc96f, codec_d; 672442b and f149e26,
+///   readmet3xt-lab). `VICTORY_RT_LEAVE_OUT=0` makes them as before.
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let skipped = super::skip_hashes();
+    if !skipped.is_empty() && shaders.iter().any(|s| skipped.contains(&s.hash)) {
+        return Some("named in VICTORY_SKIP_PIPELINES");
+    }
+    if rays_left_out() {
+        if named(shaders, b"CS_RaytracingResolve") {
+            return Some("a ray-tracing resolve without the structure builder (VICTORY_RT_LEAVE_OUT=0 makes it)");
+        }
+        if named(shaders, b"CS_ScreenProbes_ActivateRays") {
+            return Some("ray activation without the structure builder (VICTORY_RT_LEAVE_OUT=0 makes it)");
+        }
+    }
+    None
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -71,6 +127,8 @@ impl Pending {
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            left_out: left_out(&shaders),
+            waited_us: AtomicU64::new(0),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -114,10 +172,14 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline (diagnostics): left out on purpose
+/// ([`left_out`]), its shaders that do not translate, else "refused" or
+/// "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(format!("left out on purpose: {why}"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -182,9 +244,22 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Draws and dispatches (direct and indirect) asked of a pipeline left out
+/// on purpose ([`left_out`]), since the last [`take_left_out`].
+static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// See [`LEFT_OUT`] (for the frame line).
+pub(crate) fn take_left_out() -> u64 {
+    LEFT_OUT.swap(0, Ordering::Relaxed)
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
+/// queues it on first use. `None` at once for one left out on purpose.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -295,6 +370,9 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -302,7 +380,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -321,6 +399,22 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether one pipeline is waited for at most one budget (of the three in
+/// [`wait`]) over the whole run, not one budget in every frame. A pipeline
+/// whose make takes longer than its budget (a driver compile of tens of
+/// seconds, or one that never ends) otherwise cost the whole budget in every
+/// frame in which a draw asked for it: with `VICTORY_PIPELINE_WAIT_MS=10000`
+/// the picture stood still while the thing drawn with it was in view, and
+/// moved again when the camera turned away (the problem of fxceless issue
+/// 1181). After its budget its draws and dispatches are dropped until it is
+/// made, as with any pipeline past the frame's budget. (From VIctory-NVIDIA
+/// 77e13a9, trustno1-coder.) On by default; `VICTORY_PIPELINE_WAIT_ONCE=0`
+/// waits as before.
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -336,6 +430,16 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    // What is left of this pipeline's own budget ([`wait_once`]).
+    let own = if wait_once() {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); for each budget.
     static SPENT: [Mutex<(u64, Duration)>; 3] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 3];
@@ -346,7 +450,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -369,6 +473,16 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     waiting.end();
+    if wait_once() && p.made.get().is_none() {
+        let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        if Duration::from_micros(before) < budget && Duration::from_micros(before) + waited >= budget {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its wait: its draws and dispatches are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE=0: waited for in every frame)"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -651,6 +765,26 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline left out on purpose is never queued, so never made: it is
+    /// counted as left out, and named so, not as "being made" (some 630
+    /// indirect ray-tracing resolves a frame were). (VIctory-NVIDIA f149e26.)
+    #[test]
+    fn pipelines_left_out_are_counted_and_never_queued() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("a test's");
+        let p = Arc::new(p);
+        let before = LEFT_OUT.load(Ordering::Relaxed);
+        assert!(ready(&p).is_none());
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        early(&p);
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(p.made.get().is_none());
+        assert!(LEFT_OUT.load(Ordering::Relaxed) >= before + 2);
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(missing(&p).as_deref(), Some("left out on purpose: a test's"));
     }
 
     #[test]

@@ -482,14 +482,13 @@ mod tests {
     #[test]
     fn every_translator_switch_is_keyed_or_changes_nothing() {
         // In the key through `loop_limit`, `group_sync`, `shader_opt`
-        // and `host_settings` (`rdna_float` in `host_rdna`;
-        // the adapter picked by `VICTORY_D3D12_ADAPTER` by what it tells).
+        // and `host_settings` (the adapter picked by
+        // `VICTORY_D3D12_ADAPTER` by what it tells).
         const KEYED_OTHERWISE: &[&str] = &[
             "VICTORY_SHADER_LOOP_LIMIT",
             "VICTORY_GROUP_SYNC",
             "VICTORY_SHADER_OPT",
             "VICTORY_DISPATCH_SPLIT",
-            "VICTORY_RDNA_FLOAT",
             "VICTORY_D3D12_ADAPTER",
         ];
         // Printed, written out, counted, or read by tests and tools only.

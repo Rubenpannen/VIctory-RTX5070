@@ -224,9 +224,9 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -412,7 +412,7 @@ struct Tracer<'a> {
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
     /// The block of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<usize>>,
+    at: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -1303,13 +1303,23 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    /// `t` as the lanes that reach the access being traced hold it: through
-    /// joins they can have entered by one edge only ([`Self::only_edge`]).
+    /// `t` as the lanes that reach and run the access being traced hold it:
+    /// through joins they can have entered by one edge only
+    /// ([`Self::only_edge`]). Of the lanes that reach it only those its EXEC
+    /// guard lets run it: lanes that skipped the arm where a descriptor was
+    /// built (`s_cbranch_execz` to the join with EXEC clear) reach the join
+    /// by the other edge but run nothing there, so the join's access reads
+    /// what the live arm built (black squares on eyes and on what light
+    /// passes through, where an immediate sampler was taken for an unknown
+    /// one). (From VIctory-NVIDIA 545f890, codec_d.)
     fn live(&self, mut t: Term) -> Term {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = vec![(lanes.reach[at.0], true)];
+        if let Some(&Some(guard)) = lanes.guards.get(at.0).and_then(|g| g.get(at.1)) {
+            known.push((guard, true));
+        }
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -4215,5 +4225,47 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+    /// straight to the join without building the immediate sampler
+    /// `s[8:11]`. The join's `image_sample_lz` is guarded by EXEC, so only
+    /// the arm where `s[8:11]` was built can run it. (From VIctory-NVIDIA
+    /// 545f890, codec_d.)
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(structured.guards[2][0].is_some(), "join access must carry an EXEC guard");
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join should resolve the immediate sampler from the live arm: {:?}",
+            r.descriptors
+        );
     }
 }

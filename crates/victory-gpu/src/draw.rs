@@ -487,7 +487,14 @@ impl State {
         host: &crate::descriptor::host::HostHeap,
         count: u32,
     ) -> Option<u32> {
-        let first = host.dynamic(count)?;
+        // Out of slots: the flights the card has finished give theirs back
+        // when they are settled; once more after that, if no submission is
+        // under way (`crate::host::settle_for_slots`). They ran out, and the
+        // draws were dropped. (From VIctory-NVIDIA 545f890, codec_d.)
+        let first = host.dynamic(count).or_else(|| {
+            crate::host::settle_for_slots();
+            host.dynamic(count)
+        })?;
         self.dynamic.push((std::ptr::from_ref(heap) as usize, host.id(), first, count));
         Some(first)
     }
@@ -2560,10 +2567,16 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            // The view the slot holds, read once for its turn (under the
+            // views table's read lock: read three times a slot, other threads
+            // waited 86-383 ms per 5 s of a cutscene for that lock). A write
+            // of the slot meanwhile queues it again. (From VIctory-NVIDIA
+            // 13dca45, readmet3xt-lab.)
+            let held = heap.handle(index).and_then(crate::descriptor::view);
+            if let Some(View::Placed(false, resource, desc)) = &held {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let first = crate::resource::first_mip(&desc);
-                let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
+                let first = crate::resource::first_mip(desc);
+                let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -2590,9 +2603,9 @@ impl State {
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
             // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
-                && crate::resource::buffer_bytes(object as This).is_none()
-                && !crate::resource::title_fills(object as This)
+            if let Some(View::Shader(object, _)) = &held
+                && crate::resource::buffer_bytes(*object as This).is_none()
+                && !crate::resource::title_fills(*object as This)
             {
                 host.texture_slot_done(index, write, None);
                 continue;
@@ -2655,9 +2668,11 @@ impl State {
                 && !baking
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let view = heap.handle(index).and_then(|handle| {
-                if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
-            });
+            let view = if shows_other || late {
+                held.clone()
+            } else {
+                heap.handle(index).and_then(|handle| host.mirror(index, handle, true))
+            };
             let at_once = || {
                 if late && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -2990,13 +3005,50 @@ impl State {
                 })
             }),
         };
-        let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflect => image,
-        };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
+        let Some((of, image)) = image else {
+            once!(?role, "no stand-in for the indirect light: other tables (no image)");
             return false;
+        };
+        // The scene's depth, read by the diffuse light's passes only; the
+        // others bind none (the image's view was bound in its place, a UAV
+        // through an SRV table: D3D12 error 646). A depth-stencil texture's
+        // view of its stencil plane is no depth ([`stencil_view`]): the
+        // estimate made of it put every point far away with its normal to
+        // the camera (flat floors; after the _ReflectiveCaustics variant the
+        // usual place named the scene depth's stencil plane). Then another
+        // depth view of the program's tables of the image's size is taken.
+        // (From VIctory-NVIDIA c05b44b, Jeremy Goldberg; d226814 and bda6e59,
+        // readmet3xt-lab.)
+        let depth = match role {
+            Role::Resolve => {
+                let stencil_at = |(slot, offset): (u8, u32)| {
+                    let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                        return false;
+                    };
+                    stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+                };
+                let usual = if stencil_at(DEPTH) {
+                    once!(?role, "stand-in: the depth place names a stencil plane; another depth view of the tables is taken");
+                    None
+                } else {
+                    entry(ResourceType::Srv, DEPTH)
+                };
+                let size = (of.Width, of.Height);
+                let found = usual.filter(|(seen, _)| (seen.Width, seen.Height) == size).or_else(|| {
+                    t.used
+                        .iter()
+                        .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                        .filter(|u| !stencil_at((u.slot, u.table_offset_dwords)))
+                        .filter_map(|u| entry(ResourceType::Srv, (u.slot, u.table_offset_dwords)))
+                        .find(|(d, _)| depth_like(d) && (d.Width, d.Height) == size)
+                });
+                let Some((_, depth)) = found else {
+                    once!(?role, "no stand-in for the indirect light: no depth of the image's size");
+                    return false;
+                };
+                Some(depth)
+            }
+            Role::Radiance | Role::Air | Role::Reflect => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = match role {
@@ -3004,7 +3056,7 @@ impl State {
             Role::Radiance | Role::Air => 26,
         };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -3034,8 +3086,14 @@ impl State {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return None;
         };
-        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-            View::Shader(r, _) | View::Unordered(r, ..) => r,
+        // Only a view of the kind asked for (a UAV is no depth, c05b44b). A
+        // view of a texture the title placed in its memory is a placed
+        // record; its host texture is the one `placed_texture` names, as on
+        // the draw path (bda6e59).
+        let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+        let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+        let resource = match (kind, view) {
+            (ResourceType::Srv, View::Shader(r, _)) | (ResourceType::Uav, View::Unordered(r, ..)) => r,
             _ => return None,
         };
         let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -4974,6 +5032,40 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
         Some(budget) if budget > 12 * GIB => 256 * MIB,
         _ => 192 * MIB,
     }
+}
+
+/// Whether `view` is a depth-stencil texture's view of its stencil plane
+/// (formats X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT, or a 2D view of
+/// plane 1), for the light stand-ins (`State::ambient`). The description's
+/// words are D3D12_SHADER_RESOURCE_VIEW_DESC's: its union starts at word 4,
+/// so a 2D view's plane is word 6 (word 5 is its levels).
+#[cfg(windows)]
+fn stencil_view(view: Option<View>) -> bool {
+    let view = view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
+    match view {
+        Some(View::Shader(_, Some(d))) => matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1),
+        _ => false,
+    }
+}
+
+/// Whether a texture can hold a scene's depth (2D, 32-bit or 24-bit depth,
+/// with or without stencil), for the light stand-ins.
+#[cfg(windows)]
+fn depth_like(d: &D3D12_RESOURCE_DESC) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+    };
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && matches!(
+            d.Format,
+            DXGI_FORMAT_R32_TYPELESS
+                | DXGI_FORMAT_D32_FLOAT
+                | DXGI_FORMAT_R32G8X24_TYPELESS
+                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                | DXGI_FORMAT_R24G8_TYPELESS
+                | DXGI_FORMAT_D24_UNORM_S8_UINT
+        )
 }
 
 #[cfg(test)]

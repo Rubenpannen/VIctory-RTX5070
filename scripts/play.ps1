@@ -34,12 +34,9 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
     # The pipelines the title creates are written down in the cache folder, for `victory warm --used`.
     VICTORY_PIPELINE_BOOK = '1'
-    # A compute program whose approximate wave64 form hung the card (docs/findings.md); only the
-    # diagnostics build (-Build diag) can skip it.
+    # A compute program whose approximate wave64 form hung the card (docs/findings.md): its
+    # pipeline is left out, in either build.
     VICTORY_SKIP_PIPELINES = '2561af9577c47289'
-}
-if ($Build -eq 'release') {
-    Write-Host "Warning: the release build cannot skip compute 2561af9577c47289, which can hang the card."
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

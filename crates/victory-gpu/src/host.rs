@@ -933,6 +933,27 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
+/// Sends `lists` to `queue`, `apart` (the compare of copies in the card's
+/// memory) in an `ExecuteCommandLists` call of its own if it is among them.
+/// A title list can leave a buffer promoted to COPY_DEST; buffers decay to
+/// COMMON only between such calls, so the compare that copies them failed
+/// in the same call (D3D12 error 538). (From VIctory-NVIDIA d1fe0bd,
+/// Jeremy Goldberg.)
+///
+/// # Safety
+/// As `ExecuteCommandLists`: closed lists.
+unsafe fn execute_apart(queue: &ID3D12CommandQueue, lists: &[Option<ID3D12CommandList>], apart: Option<&ID3D12CommandList>) {
+    let at = apart.and_then(|apart| lists.iter().position(|l| l.as_ref() == Some(apart)));
+    let parts: [&[Option<ID3D12CommandList>]; 3] = match at {
+        Some(i) => [&lists[..i], &lists[i..=i], &lists[i + 1..]],
+        None => [lists, &[], &[]],
+    };
+    for part in parts.into_iter().filter(|part| !part.is_empty()) {
+        // SAFETY: as this function's.
+        unsafe { queue.ExecuteCommandLists(part) };
+    }
+}
+
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
     if let Some(host) = host() {
@@ -1074,9 +1095,6 @@ fn create() -> windows::core::Result<Host> {
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
-            // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
-            let amd = crate::indirect::amd(&device);
-            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -3710,6 +3728,26 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// [`settle_now`] for a recording that ran out of dynamic view slots: the
+/// flights the card has finished give theirs back. Only if no submission
+/// holds the submission lock: a submission may be waiting for the very
+/// thread that asks (lists recorded at submission), and that one then goes
+/// without, as before.
+pub(crate) fn settle_for_slots() {
+    if !late() {
+        return;
+    }
+    let Some(host) = host() else {
+        return;
+    };
+    let mut submitted = match host.submitted.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    host.settle(&mut submitted, WHY_FENCE);
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -6200,7 +6238,10 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        // The compare goes in an `ExecuteCommandLists` call of its own
+        // ([`execute_apart`]).
+        let compare = card.as_ref().and_then(|c| c.check.clone());
+        if let Some(check) = compare.clone() {
             #[cfg(feature = "diagnostics")]
             marks.push((lists.len(), crate::copystat::Timed::Compare));
             lists.push(Some(check));
@@ -6243,7 +6284,7 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    execute_apart(&self.queue, &lists[from..to], compare.as_ref());
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -6302,7 +6343,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                execute_apart(&self.queue, group, compare.as_ref());
                 self.card_sent();
                 let waited = self
                     .queue
@@ -9441,6 +9482,8 @@ impl Meter {
             });
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
+            let left_out = crate::pipeline::take_left_out() as f64 / frames;
+            let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
             let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
             let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
@@ -9630,9 +9673,11 @@ impl Meter {
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                      GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                     {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                     {indirect:.0} indirect ({left_out:.0} of all these left out on purpose: \
+                     VICTORY_SKIP_PIPELINES, ray-tracing passes without the structure builder); heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                      textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                     raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}",
                     picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                     picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                     picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),

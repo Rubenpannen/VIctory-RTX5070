@@ -496,8 +496,16 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
+/// Draws and dispatches asked of pipelines left out on purpose since the
+/// last call (`make::left_out`: `VICTORY_SKIP_PIPELINES`, the ray-tracing
+/// passes without the structure builder).
+#[cfg(windows)]
+pub(crate) fn take_left_out() -> u64 {
+    make::take_left_out()
+}
+
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -517,13 +525,21 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+/// The shader hashes of `VICTORY_SKIP_PIPELINES`: their pipelines are left
+/// out in every build (`make::left_out`), and the diagnostics build names
+/// their dropped draws as skipped.
+#[cfg(windows)]
+fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    let hashes = skip_hashes();
     if hashes.is_empty() {
         return None;
     }

@@ -235,35 +235,26 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     Ok(())
 }
 
-/// Sets the host wave size and float rules that offline translation is done
-/// for, as the runtime would on this PC:
-/// - `VICTORY_HOST_WAVE=<lanes>` (older name `VICTORY_HOST_MAX_WAVE`), e.g.
-///   32 for a card whose waves have at most 32 lanes;
-/// - `VICTORY_HOST_RDNA=1|0`: as for an AMD RDNA card or not
-///   (`VICTORY_RDNA_FLOAT`).
+/// Sets the host wave size that offline translation is done for, as the
+/// runtime would on this PC: `VICTORY_HOST_WAVE=<lanes>` (older name
+/// `VICTORY_HOST_MAX_WAVE`), e.g. 32 for a card whose waves have at most 32
+/// lanes.
 ///
-/// What is not set is taken from this PC's card. Without a card the wave
-/// size stays unknown (wave64 programs keep their form) and there are no
-/// RDNA rules. (`replay --retranslate` had 64 and RDNA fixed, and
-/// `translate` an unknown wave size: wave64 forms that NVIDIA refuses.)
+/// Unset, it is taken from this PC's card. Without a card the wave size
+/// stays unknown (wave64 programs keep their form). (`replay --retranslate`
+/// had 64 fixed, and `translate` an unknown wave size: wave64 forms that
+/// NVIDIA refuses.)
 pub(crate) fn host_waves() {
     let lanes = ["VICTORY_HOST_WAVE", "VICTORY_HOST_MAX_WAVE"]
         .iter()
-        .find_map(|name| std::env::var(name).ok()?.trim().parse::<u32>().ok());
-    let rdna = std::env::var_os("VICTORY_HOST_RDNA").map(|v| v == "1");
-    let card = (lanes.is_none() || rdna.is_none())
-        .then(|| Host::new(false).ok()?.waves())
-        .flatten();
-    let lanes = lanes.or(card.map(|c| c.0));
-    let rdna = rdna.or(card.map(|c| c.1)).unwrap_or(false);
+        .find_map(|name| std::env::var(name).ok()?.trim().parse::<u32>().ok())
+        .or_else(|| Host::new(false).ok()?.waves());
     if let Some(lanes) = lanes {
         emit::set_host_max_wave(lanes);
     }
-    emit::set_host_rdna(rdna);
     eprintln!(
-        "translating for waves of up to {} lanes{}",
-        lanes.map_or("an unknown number of".to_owned(), |n| n.to_string()),
-        if rdna { ", RDNA float rules" } else { "" }
+        "translating for waves of up to {} lanes",
+        lanes.map_or("an unknown number of".to_owned(), |n| n.to_string())
     );
 }
 
@@ -653,9 +644,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     let first = emit::emit_with_retries(container, &p, &program, &s, &i, &r);
                     let emitted = match first {
                         // (killed lanes leaving at the kill, as `emit::translate` tries next)
-                        Err(ShaderError::Unsupported { what, .. })
-                            if what == "a constant lane mask" =>
-                        {
+                        Err(ShaderError::Unsupported { what: "a constant lane mask", .. }) => {
                             structure::without_live_quads(|| structure::structure(&program))
                                 .and_then(|s| {
                                     emit::emit_with_retries(container, &p, &program, &s, &i, &r)

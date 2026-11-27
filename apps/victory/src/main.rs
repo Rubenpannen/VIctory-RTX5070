@@ -78,7 +78,6 @@ enum Command {
     /// VICTORY_HOST_WAVE overrides the host wave width, including with --warm.
     /// VICTORY_HOST_MAX_WAVE is a compatibility alias. When both values are
     /// valid, VICTORY_HOST_WAVE takes precedence. Zero means unknown width.
-    /// For ordinary translation, VICTORY_HOST_RDNA=1 selects RDNA float settings.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -217,7 +216,7 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // As for this PC's card, or `VICTORY_HOST_WAVE` / `VICTORY_HOST_RDNA`.
+            // As for this PC's card, or `VICTORY_HOST_WAVE`.
             translate::host_waves();
             // The width asked for, if any, set again on each worker thread.
             let wave = translate::host_wave::select(

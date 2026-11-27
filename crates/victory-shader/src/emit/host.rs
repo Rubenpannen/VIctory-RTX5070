@@ -210,13 +210,12 @@ impl Host {
         }
     }
 
-    /// The device's widest wave and whether it is an AMD RDNA card (waves of
-    /// 32 and 64), as the runtime reads them (`victory-gpu`'s host): what
-    /// [`super::set_host_max_wave`] and [`super::set_host_rdna`] are given
-    /// for translating as for this card. `None` if the device does not say.
-    pub fn waves(&self) -> Option<(u32, bool)> {
+    /// The device's widest wave, as the runtime reads it (`victory-gpu`'s
+    /// host): what [`super::set_host_max_wave`] is given for translating as
+    /// for this card. `None` if the device does not say.
+    pub fn waves(&self) -> Option<u32> {
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        // SAFETY: plain queries with valid out pointers.
+        // SAFETY: a plain query with a valid out pointer.
         unsafe {
             self.device
                 .CheckFeatureSupport(
@@ -225,40 +224,14 @@ impl Host {
                     size_of_val(&o1) as u32,
                 )
                 .ok()?;
-            let amd = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()))
-                .and_then(|a| a.GetDesc1())
-                .is_ok_and(|d| d.VendorId == 0x1002);
-            Some((
-                o1.WaveLaneCountMax,
-                amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64,
-            ))
         }
+        Some(o1.WaveLaneCountMax)
     }
 
     /// The name of the adapter that actually created the device.
     pub fn adapter_name(&self) -> Option<String> {
         let desc = adapter_desc(&self.device).ok()?;
         Some(String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned())
-    }
-
-    /// The maximum wave size and whether the adapter is AMD RDNA, for
-    /// offline shader translation followed by host pipeline creation.
-    pub fn translation_caps(&self) -> Option<(u32, bool)> {
-        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        // SAFETY: a feature structure of the requested type and size.
-        unsafe {
-            self.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS1,
-                (&raw mut waves).cast(),
-                size_of_val(&waves) as u32,
-            )
-        }
-        .ok()?;
-        let rdna = waves.WaveLaneCountMin == 32
-            && waves.WaveLaneCountMax == 64
-            && adapter_desc(&self.device).is_ok_and(|desc| desc.VendorId == 0x1002);
-        Some((waves.WaveLaneCountMax, rdna))
     }
 
     /// The root signature translated shaders expect: user data per stage

@@ -61,8 +61,8 @@ in that order of size:
   each 32-lane half as a wave of its own, which is approximate. Runs that refused it
   (`VICTORY_WAVE_LOCAL=idiom`) ran without a loss. Refusing every approximate form
   instead brought back blocky patches in the character shadows, so the forms stay on and
-  `scripts\play.ps1` skips that one program (`VICTORY_SKIP_PIPELINES`, diagnostics
-  builds). 13 of the 16 approximate programs fail the exact form for the same reason
+  `scripts\play.ps1` skips that one program (`VICTORY_SKIP_PIPELINES`, in every
+  build since 2026-11-27; before, in diagnostics builds only). 13 of the 16 approximate programs fail the exact form for the same reason
   ("a count or sum over the wave used as data"), so the translator cannot single it out.
 - **A rare lost write** (6 of 200 runs of a stress test): a view was mapped between our
   look at its guards and our lock, and views were opened one after another. None in 603
@@ -81,7 +81,8 @@ in that order of size:
 - Mapping pages on sixteen threads: no more pages mapped, frames longer.
 - Scalar buffer loads four dwords a call (`VICTORY_SHADER_OPT=127`): no gain on this card.
 - Wave sizes, fused multiply-adds, fast reciprocals, raw picked buffers, leaving out
-  barriers: nothing to 0.1 ms each. Exact RDNA float rules (`VICTORY_RDNA_FLOAT`): 0.8 ms.
+  barriers: nothing to 0.1 ms each. Exact RDNA float rules (a switch
+  this fork has removed, as they hold on an AMD card only): 0.8 ms.
 - Running the console's shader code natively on the card: the Windows driver takes no raw
   code, the two generations differ, and a Vulkan host layer ends at the same compiler. What
   is left to gain from shader code was guessed at under 1 ms.
