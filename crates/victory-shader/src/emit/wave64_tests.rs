@@ -1603,6 +1603,25 @@ fn flag_wave(native: &NativeProgram) -> Option<u32> {
     lowered.expect("lower").wave_size
 }
 
+/// A select on a lane mask held as a number takes the lane's own bit of it, so the program
+/// needs the console's lanes, as one reading the mask through a guard or as data does. It
+/// was lowered without them: in a release build each lane took the bit of its host lane
+/// (with no wave size, whatever the host's waves are); a debug build stopped on the
+/// assertion in `cross_lane`.
+#[test]
+fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
+    let words = [
+        0xBEEA_03FF, // s_mov_b32 vcc_lo, 0x55555555 (every other lane)
+        0x5555_5555,
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x0200_0A80, // v_cndmask_b32 v0, 0, v5, vcc_lo
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    // 64 threads in waves of 32: two console waves, and no LDS
+    assert_eq!(flag_wave(&native_of(&words, false, 64)), Some(32));
+}
+
 #[test]
 fn a_branch_that_only_raises_an_lds_flag_runs_in_waves_of_32() {
     // a read that misses the other host wave's write changes nothing the branch leaves behind
@@ -1671,4 +1690,57 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
         }
     }
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
+}
+
+/// A tile program's LDS use: thread 0 alone stores the tile's starting maximum (0, dword 0)
+/// and minimum (-1, dword 1), then every thread `ds_max_u32`s and `ds_min_u32`s its key in and
+/// reads both back. `max_start` replaces the 0; `stray`: a write at an address that is not a
+/// constant; `atomics: false` leaves them out.
+fn tile_min_max(max_start: u32, stray: bool, atomics: bool) -> NativeProgram {
+    let mut body = vec![
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0x7E06_02FF,
+        max_start,   // v_mov_b32 v3, max_start
+        0x7E08_02C1, // v_mov_b32 v4, -1
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xD838_0100,
+        0x0004_0305, // ds_write2_b32 v5, v3, v4 offset1:1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E0A_0280, // v_mov_b32 v5, 0
+    ];
+    if stray {
+        body.extend([0xD834_0000, 0x0000_0000]); // ds_write_b32 v0, v0
+    }
+    if atomics {
+        body.extend([
+            0xD81C_0004,
+            0x0000_0005, // ds_min_u32 v5, v0 offset:4
+            0xD820_0000,
+            0x0000_0005, // ds_max_u32 v5, v0
+        ]);
+    }
+    body.extend([0xD8DC_0100, 0x0600_0005]); // ds_read2_b32 v[6:7], v5 offset1:1
+    let mut program = native(&body);
+    if let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}
+
+/// (fxceless a9181638) The dwords every thread accumulates into, which one thread alone
+/// initialises, are stored with their starting value at the program's start as well.
+#[test]
+fn accumulator_inits_are_hoisted_to_the_start() {
+    let hoists = |program: NativeProgram| {
+        let p = crate::spill::build(&program).unwrap();
+        lower::lds_init_hoists(&p, 128)
+    };
+    assert_eq!(hoists(tile_min_max(0, false, true)), [(0, 0), (1, u32::MAX)]);
+    // a start that is not the maximum's identity stays where it is
+    assert_eq!(hoists(tile_min_max(5, false, true)), [(1, u32::MAX)]);
+    // plain stores (a flag, data) are not accumulators
+    assert!(hoists(tile_min_max(0, false, false)).is_empty());
+    // a write that could land anywhere: nothing is known
+    assert!(hoists(tile_min_max(0, true, true)).is_empty());
 }

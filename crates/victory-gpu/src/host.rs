@@ -1196,6 +1196,19 @@ mod tests {
         }
     }
 
+    /// Only what lies between, before and after the runs is zeroed.
+    #[test]
+    fn only_bytes_outside_the_runs_are_zeroed() {
+        let mut dst = [7u8; 16];
+        super::zero_between(&mut dst, 100, &[(102, 3), (104, 2), (110, 4)]);
+        assert_eq!(dst, [0, 0, 7, 7, 7, 7, 0, 0, 0, 0, 7, 7, 7, 7, 0, 0]);
+        let mut dst = [7u8; 4];
+        super::zero_between(&mut dst, 100, &[(100, 4)]);
+        assert_eq!(dst, [7; 4]);
+        super::zero_between(&mut dst, 100, &[]);
+        assert_eq!(dst, [0; 4]);
+    }
+
     /// Zeros for a title destination that went meanwhile are no fault.
     #[test]
     fn zeros_where_nothing_is_are_lost() {
@@ -1413,7 +1426,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<ByCopy<TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1506,10 +1519,9 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+/// By texture address (an address of ours, asked at every draw: the quick
+/// hash; from Belobug PR #415, Esteban-V).
+type States = ByCopy<(u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -2525,6 +2537,11 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
+    /// Upload buffers taken from [`UPLOAD_POOL`] ([`upload_pool`]), with
+    /// their mapping and their size: given back to it when the list is
+    /// reset (counted in [`ALIVE`] as `uploads` are, their bytes in
+    /// `upload_bytes`).
+    pooled: Vec<(ID3D12Resource, usize, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -2542,7 +2559,7 @@ struct Deferred {
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// The last card-written source copied into each aliased host texture
     /// in this list ([`HostList::alias_source_changed`]).
     texture_aliases: std::collections::HashMap<usize, usize>,
@@ -2594,9 +2611,94 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[6].fetch_sub((self.uploads.len() + self.pooled.len()) as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // A list's steps go when it is reset, which is only once its last
+        // submission has run (`HostList::reset`), or when its submission
+        // with card steps has landed (`card_steps`): a pooled buffer that
+        // nothing else holds then is read by no one. The steps go first:
+        // a fill names the buffer it fills.
+        if !self.pooled.is_empty() {
+            self.copies.clear();
+            self.placed_constants.clear();
+        }
+        for (buffer, data, size) in self.pooled.drain(..) {
+            if references(&buffer) == 1 {
+                upload_pool_put(size, buffer, data);
+            }
+        }
     }
+}
+
+/// Whether a list's upload buffers in shared memory (with
+/// `VICTORY_CARD_STEPS` 2 or more, a buffer per upload:
+/// [`HostList::upload`]) are used again: taken from [`UPLOAD_POOL`] and given
+/// back to it when the list is reset (`VICTORY_UPLOAD_POOL=1`, or its phase
+/// of `VICTORY_AB`; off by default: each one made and let go, as before).
+///
+/// Each is a committed buffer of its own, waited for until the card has
+/// mapped it: with card steps on an RTX 5070, 23,000 of 40,000 shared
+/// buffers made in a run were these (avatarmanz/VIctory-7900XTX#433,
+/// SharpMan). Buffers up to 16 MiB, in sizes of powers of two from 64 KiB
+/// (a committed buffer takes 64 KiB however small), and at most 256 MiB of
+/// them kept. A buffer taken again has stale bytes: an upload writes all of
+/// its own before anything reads them, and the rest is never read.
+fn upload_pool() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_POOL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_UPLOAD_POOL"))
+}
+
+/// The largest upload [`upload_pool`] takes, and the bytes the pool keeps.
+const UPLOAD_POOL_LARGEST: u64 = 16 << 20;
+const UPLOAD_POOL_MOST: u64 = 256 << 20;
+
+/// List upload buffers given back ([`upload_pool`]), by size, with their
+/// mapping; and the bytes of them all.
+#[allow(clippy::type_complexity)]
+static UPLOAD_POOL: Mutex<(u64, std::collections::BTreeMap<u64, Vec<(ID3D12Resource, usize)>>)> =
+    Mutex::new((0, std::collections::BTreeMap::new()));
+
+/// Since the start: uploads served from [`UPLOAD_POOL`], and buffers made
+/// for it.
+static UPLOAD_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The size of the pooled buffer an upload of `size` bytes gets.
+fn upload_pool_size(size: u64) -> u64 {
+    size.max(1).next_power_of_two().max(64 << 10)
+}
+
+fn upload_pool_take(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let (buffer, data) = pool.1.get_mut(&size)?.pop()?;
+    pool.0 -= size;
+    UPLOAD_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+    Some((buffer, data as *mut u8))
+}
+
+fn upload_pool_put(size: u64, buffer: ID3D12Resource, data: usize) {
+    let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.0 + size > UPLOAD_POOL_MOST {
+        return;
+    }
+    pool.0 += size;
+    pool.1.entry(size).or_default().push((buffer, data));
+}
+
+/// With the frame line: what [`upload_pool`] did since the start. Nothing
+/// while it has done nothing.
+fn upload_pool_line() {
+    let [taken, made] = [0, 1].map(|i| UPLOAD_POOL_STATS[i].load(Ordering::Relaxed));
+    if taken + made == 0 {
+        return;
+    }
+    let kept = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner()).0 >> 20;
+    tracing::info!(
+        "list upload buffers used again (VICTORY_UPLOAD_POOL): {taken} taken from the pool, {made} made for it, {kept} MB in it now"
+    );
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
@@ -2983,8 +3085,9 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it (a reference of ours:
+    /// the title may let it go meanwhile).
+    Signal(crate::fence::FenceRef, u64),
 }
 
 /// Return shader-visible descriptor ranges as soon as the GPU has finished
@@ -3525,6 +3628,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
+    let fence = crate::fence::FenceRef::retain(fence as crate::object::This);
     line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
@@ -4033,10 +4137,10 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, past] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; {past:.1} pages past the cap put in, not settled (VICTORY_MASKED_PATCH)",
             bytes / (1 << 20) as f64
         );
         let u = crate::shadow::under_stats().map(|n| n as f64 / frames);
@@ -5347,7 +5451,7 @@ impl Host {
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value);
+                    crate::fence::set(fence.as_this(), value);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5812,7 +5916,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
             if last > 0 {
@@ -7101,12 +7205,7 @@ impl HostList {
         if !crate::texback::wanted(resource) {
             return;
         }
-        let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
-        }
+        crate::texback::want(&mut self.deferred().back_wanted, resource);
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied
@@ -7286,6 +7385,7 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.pooled.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -7448,9 +7548,28 @@ impl HostList {
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// shortcut: one buffer per copy; pool them once uploads are frequent
+    /// (`VICTORY_UPLOAD_POOL=1` does, for those in shared memory).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
+        if card_steps::stage() > 1 && size <= UPLOAD_POOL_LARGEST && upload_pool() {
+            let class = upload_pool_size(size);
+            let (buffer, data) = match upload_pool_take(class) {
+                Some(taken) => taken,
+                None => {
+                    let made = host.shared_buffer(class)?;
+                    UPLOAD_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    made
+                }
+            };
+            name(&buffer, || format!("list upload {size:#x}"));
+            let mut deferred = self.deferred();
+            ALIVE[6].fetch_add(1, Ordering::Relaxed);
+            ALIVE[7].fetch_add(class, Ordering::Relaxed);
+            deferred.upload_bytes += class;
+            deferred.pooled.push((buffer.clone(), data as usize, class));
+            return Some((buffer, data));
+        }
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
@@ -8897,13 +9016,16 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// reads). What the runtime's record says is mapped is read in one go each,
 /// and by pieces where that fails; memory it has no record of by pieces.
 pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
-    dst.fill(0);
     let (start, len) = (src as usize, dst.len());
     let mut got = 0;
     let mut runs = crate::inplace::shown_runs(start, len);
     if runs.is_empty() {
         runs.push((start, len));
     }
+    // Every byte of a run is read or zeroed below: only the rest is zeroed
+    // here, not the whole buffer first (one write over all of it less;
+    // from Belobug PR #413, Esteban-V).
+    zero_between(dst, start, &runs);
     for (at, n) in runs {
         let piece = &mut dst[at - start..at - start + n];
         if read_into(at as *const u8, piece) {
@@ -8930,6 +9052,20 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// Zeros what of `dst` (title memory from `start`) `runs` (in order,
+/// within `dst`: address, bytes) leave out.
+fn zero_between(dst: &mut [u8], start: usize, runs: &[(usize, usize)]) {
+    let mut done = 0;
+    for &(at, n) in runs {
+        let from = at - start;
+        if from > done {
+            dst[done..from].fill(0);
+        }
+        done = done.max(from + n);
+    }
+    dst[done..].fill(0);
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -9313,6 +9449,7 @@ impl Meter {
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
             crate::shadow::exact_line(frames);
+            upload_pool_line();
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
@@ -9409,7 +9546,7 @@ impl Meter {
                          the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                          as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                          {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
-                         {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
+                         {} ranges of memory mapped, unmapped or written under texture views ({} widened a kept one at capacity), {} slots made due by them, \
                          {} made slots found unmapped and made null",
                         crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                         crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
@@ -9456,7 +9593,7 @@ impl Meter {
                     let [kept, dropped, slots, uploaded] =
                         [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                     tracing::info!(
-                        "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                        "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} widened a kept one at capacity);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
                         bytes >> 20,
                         if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                         if mode & 4 != 0 { "told as well" } else { "counted only" },

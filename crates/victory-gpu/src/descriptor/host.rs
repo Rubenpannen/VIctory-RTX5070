@@ -604,7 +604,9 @@ pub(crate) struct Spans {
     first: std::collections::HashMap<u32, (u32, u64)>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
-    /// descriptions, thousands of times a frame).
+    /// descriptions, thousands of times a frame). By description without
+    /// its filler words (`crate::resource::without_filler`), which do not
+    /// change the size.
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
 }
 
@@ -638,12 +640,8 @@ impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
     fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
-            return known;
-        }
-        let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
-        bytes
+        let desc = crate::resource::without_filler(desc);
+        *self.sizes.entry(desc).or_insert_with(|| crate::resource::placed_bytes(&desc))
     }
 
     /// The starts of the spans that overlap `[start, end)`, each taken to
@@ -798,10 +796,10 @@ impl Spans {
 /// has them mapped; `crate::watch::title_memory_written`), since a texture
 /// pass last took the ranges ([`page_written`]). Kept apart from
 /// [`REMAPPED`] so that what such writes do is counted by itself.
-static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static PAGE_WRITTEN: Mutex<Ranges> = Mutex::new(Ranges::new());
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
+/// Since the start: such ranges kept for a pass; ranges that widened a kept
+/// one at capacity ([`Ranges::insert`]); slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
 /// before the write (out of the queue, or in it after an upload): they are
 /// the ones that kept the bytes from before, and the ones made due when
@@ -821,30 +819,96 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    if ranges.insert(start, end) {
+        PAGE_WRITES[1].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
-static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static REMAPPED: Mutex<Ranges> = Mutex::new(Ranges::new());
+
+/// Ranges of memory kept until a texture pass takes them, disjoint and
+/// sorted, at most `MOST` (2^15 for the two lists). At capacity a new range is joined to its
+/// nearer neighbour, so that a pass still sees every byte written since the
+/// last one (the list used to be emptied, losing every range in it).
+/// (From stellarr-studio/kelvaroq e5ea6729, patch 0010.)
+pub(crate) struct Ranges<const MOST: usize = { 1 << 15 }> {
+    /// Start to end.
+    ends: std::collections::BTreeMap<u64, u64>,
+}
+
+impl<const MOST: usize> Ranges<MOST> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            ends: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// Keeps `[start, end)`, joined to the ranges it touches. True: the list
+    /// was full, and a neighbour was widened over a gap no one wrote.
+    pub(crate) fn insert(&mut self, mut start: u64, mut end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        if let Some((&left, &left_end)) = self.ends.range(..=start).next_back()
+            && left_end >= start
+        {
+            if left_end >= end {
+                return false;
+            }
+            start = left;
+            self.ends.remove(&left);
+        }
+        while let Some((&right, &right_end)) = self.ends.range(start..=end).next() {
+            end = end.max(right_end);
+            self.ends.remove(&right);
+        }
+        if self.ends.len() < MOST.max(1) {
+            self.ends.insert(start, end);
+            return false;
+        }
+        // Apart from every kept range: the nearer neighbour is widened over
+        // the gap to this one.
+        let left = self.ends.range(..start).next_back().map(|(&s, &e)| (s, start - e));
+        let right = self.ends.range(end..).next().map(|(&s, &e)| (s, e, s - end));
+        match (left, right) {
+            (Some((s, gap)), r) if r.is_none_or(|(_, _, other)| gap <= other) => {
+                self.ends.insert(s, end);
+            }
+            (_, Some((s, e, _))) => {
+                self.ends.remove(&s);
+                self.ends.insert(start, e);
+            }
+            // A full list has a neighbour.
+            _ => {
+                self.ends.insert(start, end);
+            }
+        }
+        true
+    }
+
+    /// The ranges (start, end), in order.
+    pub(crate) fn into_vec(self) -> Vec<(u64, u64)> {
+        self.ends.into_iter().collect()
+    }
+}
+
+impl<const MOST: usize> Default for Ranges<MOST> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -856,7 +920,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
+/// ranges that widened a kept one at capacity ([`Ranges::insert`]); slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -883,28 +947,17 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    // No pass may run for long (no shader that picks textures by index is
+    // bound): at capacity the ranges are widened, not dropped.
+    if ranges.insert(start, end) {
+        STALE[2].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -1038,8 +1091,8 @@ impl Queued {
 }
 
 /// Slots due of a [`TextureQueue`], of those looked at before and of the
-/// others: the frame each was written in, the slot and its write's number.
-type Due = [Vec<(u64, u32, u64)>; 2];
+/// others: the slot and its write's number.
+type Due = [Vec<(u32, u64)>; 2];
 
 impl TextureQueue {
     fn insert(&mut self, index: u32, waiting: Waiting) {
@@ -1107,30 +1160,55 @@ impl TextureQueue {
     fn all_due(&self, frame: u64) -> Due {
         let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+            due[usize::from(w.looks == 0 && w.mapped == 0)].push((index, w.write));
         }
         due
     }
 
-    /// What [`TextureQueue::due`] says of `due` (with nothing held: some
-    /// ten thousand slots are sorted).
+    /// What [`TextureQueue::due`] says of `due` (with nothing held): those
+    /// looked at before, newest write first, then the others, newest and
+    /// oldest in turn, `max` at most. Only what the pass takes is sorted
+    /// (some ten thousand slots were sorted whole for a pass of a few
+    /// hundred). (From Belobug/VIctory-Belobug-AMD#548, hajduzsolt.)
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
-            }
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if max == 0 {
+            return Vec::new();
         }
-        order.truncate(max);
-        order
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
+        again.sort_unstable_by(newest_first);
+        let take = (max - again.len()).min(fresh.len());
+        if take == 0 {
+            return again;
+        }
+        // The newest half (one more if odd) and the oldest half.
+        let newest_count = take.div_ceil(2);
+        let (newest, oldest) = if take == fresh.len() {
+            fresh.sort_unstable_by(newest_first);
+            fresh.split_at_mut(newest_count)
+        } else {
+            fresh.select_nth_unstable_by(newest_count, newest_first);
+            let (newest, rest) = fresh.split_at_mut(newest_count);
+            let start_of_oldest = rest.len() - take / 2;
+            if start_of_oldest < rest.len() {
+                rest.select_nth_unstable_by(start_of_oldest, newest_first);
+            }
+            let oldest = &mut rest[start_of_oldest..];
+            newest.sort_unstable_by(newest_first);
+            oldest.sort_unstable_by(newest_first);
+            (newest, oldest)
+        };
+        again.reserve(take);
+        let mut oldest = oldest.iter().rev();
+        for &entry in newest.iter() {
+            again.push(entry);
+            again.extend(oldest.next().copied());
+        }
+        again
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1926,7 +2004,7 @@ impl HostHeap {
     /// whether memory was noted since a pass last took the notes.
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
-        let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        let noted = |ranges: &Mutex<Ranges>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
     }
 
@@ -2021,7 +2099,7 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner())).into_vec();
         if ranges.is_empty() {
             return 0;
         }
@@ -2078,7 +2156,7 @@ impl HostHeap {
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner())).into_vec();
         if ranges.is_empty() {
             return 0;
         }
@@ -3038,6 +3116,10 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
+        // A null constant buffer view: no view of no bytes, a null one.
+        if size == 0 {
+            return self.make_at(index, &View::Constant(0, 0));
+        }
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -3052,8 +3134,15 @@ impl HostHeap {
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
-            // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            // SAFETY: a live buffer.
+            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let offset = gpu - base;
+            let first = offset / 4;
+            // The constant buffer's size, rounded up to 256 bytes, may reach past the
+            // buffer's end: the raw view stops there (a raw view past the end removed
+            // the device on an RTX 4070).
+            let elements =
+                ((u64::from(desc.SizeInBytes).min(width.saturating_sub(offset)) / 4) as u32).max(1);
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3061,7 +3150,7 @@ impl HostHeap {
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
                         FirstElement: first,
-                        NumElements: desc.SizeInBytes / 4,
+                        NumElements: elements,
                         StructureByteStride: 0,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                     },
@@ -3847,7 +3936,24 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
 /// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
 /// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// The fourth: those made from the view's own dword instead ([`twin_exact`]).
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether raw twins of buffer views that do not begin on 16 bytes begin at
+/// the view's own dword (`VICTORY_TWIN_EXACT`, on when unset; `=0`: a null
+/// view, as before, unless [`move_raw`] can move a staged one). Read once.
+///
+/// shortcut: D3D12 asks raw views to begin on 16 bytes; AMD's hardware reads a
+/// raw buffer from any dword, what the host's driver does with one that does
+/// not is its own. Null, such a twin reads zeros: the tree culling runs in two
+/// dispatches a frame, and the second one's batch list begins right after the
+/// first one's 4-byte entries, so in every frame whose split left it off 16
+/// bytes the second dispatch read a list of zeros and whole trees and palms
+/// dropped out for single frames while the camera moved.
+fn twin_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_none_or(|v| v != "0"))
+}
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
@@ -4000,7 +4106,15 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && twin_exact() {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first + u64::from(by / 4);
+                desc.Anonymous.Buffer.NumElements = count - by / 4;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { host.device.CreateShaderResourceView(&shadow.buffer, Some(&desc), twin) };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4143,7 +4257,22 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && twin_exact() {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first + u64::from(by / 4);
+                desc.Anonymous.Buffer.NumElements = count - by / 4;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe {
+                    host.device.CreateUnorderedAccessView(
+                        &shadow.buffer,
+                        None::<&ID3D12Resource>,
+                        Some(&desc),
+                        twin,
+                    )
+                };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4312,6 +4441,10 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // A null constant buffer view ([`crate::descriptor::create_cbv`]).
+            if address == 0 || size == 0 {
+                return None;
+            }
             let Some((shadow, gpu)) = constant_home(address, size) else {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -5073,6 +5206,62 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pass of `max` slots takes the first `max` of the whole order
+    /// (from Belobug/VIctory-Belobug-AMD#548).
+    #[test]
+    fn limited_texture_passes_match_the_full_order() {
+        let fresh = vec![(2, 4), (3, 8), (5, 1), (1, 6), (4, 2), (8, 10), (9, 3)];
+        let again = vec![(6, 7), (7, 5), (0, 9)];
+        let full =
+            [(0, 9), (6, 7), (7, 5), (8, 10), (5, 1), (3, 8), (4, 2), (1, 6), (9, 3), (2, 4)];
+        for max in 0..=full.len() + 1 {
+            let ordered = TextureQueue::in_order([again.clone(), fresh.clone()], max);
+            assert_eq!(ordered.as_slice(), &full[..max.min(full.len())]);
+        }
+    }
+
+    /// Ranges written out of order join their neighbours and keep the gaps
+    /// no one wrote (from stellarr-studio/kelvaroq e5ea6729).
+    #[test]
+    fn ranges_join_neighbours_and_keep_holes() {
+        let mut ranges = Ranges::<4>::new();
+        for (start, end) in [(10, 20), (40, 50), (25, 30), (20, 25), (29, 41), (0, 2), (10, 15)] {
+            assert!(!ranges.insert(start, end));
+        }
+        assert_eq!(ranges.into_vec(), [(0, 2), (10, 50)]);
+    }
+
+    /// At capacity a range widens its nearer neighbour; nothing is lost.
+    #[test]
+    fn full_ranges_widen_and_keep_every_write() {
+        let mut ranges = Ranges::<2>::new();
+        assert!(!ranges.insert(10, 15));
+        assert!(!ranges.insert(30, 35));
+        assert!(ranges.insert(25, 26));
+        assert!(ranges.insert(4, 6));
+        assert!(ranges.insert(38, 40));
+        assert!(!ranges.insert(30, 30));
+        let previous = std::mem::take(&mut ranges);
+        assert_eq!(previous.into_vec(), [(4, 15), (25, 40)]);
+        assert!(!ranges.insert(u64::MAX - 1, u64::MAX));
+        assert_eq!(ranges.into_vec().len(), 1);
+
+        let mut ranges = Ranges::<7>::new();
+        let mut written = [false; 509];
+        for i in 0..130 {
+            let start = i * 47 % 503;
+            let end = start + (i % 5) + 1;
+            ranges.insert(start as u64, end as u64);
+            written[start..end].fill(true);
+        }
+        let kept = ranges.into_vec();
+        assert!(kept.len() <= 7);
+        assert!(kept.windows(2).all(|pair| pair[0].1 < pair[1].0));
+        for (i, _) in written.into_iter().enumerate().filter(|(_, dirty)| *dirty) {
+            assert!(kept.iter().any(|&(a, b)| (a..b).contains(&(i as u64))));
+        }
+    }
 
     /// Typed buffer views of 32-bit integer formats are made in the float
     /// format of the same width (the shaders' float loads and stores then

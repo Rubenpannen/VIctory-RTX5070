@@ -387,6 +387,15 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
+/// Root views bound as one-view tables in a list, by (address, view);
+/// keyed by addresses of ours, asked at every draw (from Belobug PR #415,
+/// Esteban-V).
+type RootSlots = std::collections::HashMap<
+    (usize, u64),
+    RootSlot,
+    std::hash::BuildHasherDefault<crate::host::AddressHash>,
+>;
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -455,9 +464,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: RootSlots,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: RootSlots,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -2164,7 +2173,11 @@ impl State {
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        // Looked at before it is swapped: every draw asks, on many threads,
+        // and only the first of a frame needs to write the shared line
+        // (from Belobug PR #414, Esteban-V).
+        let first =
+            FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
@@ -3366,8 +3379,40 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    // With the launch stage (`VICTORY_MESH_LAUNCH=1`) the
+                    // count goes to it as a root constant (`crate::launch`);
+                    // in an A/B phase without, the pipeline without it runs.
+                    let bound = crate::launch::on()
+                        .then(|| {
+                            crate::pipeline::host_pipeline_for(
+                                self.pipeline as This,
+                                &self.target_formats,
+                            )
+                        })
+                        .flatten();
+                    match bound.filter(|p| p.launch.is_some()) {
+                        None => {
+                            // SAFETY: an open list with everything set.
+                            unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                        }
+                        Some(p) if crate::launch::now() => {
+                            let roots = p.launch.as_ref().map_or([0; 3], |l| l.roots);
+                            let what = crate::launch::Launch::Direct(x.min(65_535));
+                            crate::launch::record(list, roots, what);
+                        }
+                        Some(p) => {
+                            if let Some(plain) = p.plain() {
+                                // SAFETY: an open list and a live pipeline of
+                                // the same root signature; everything set.
+                                unsafe {
+                                    list.list.SetPipelineState(plain);
+                                    l6.DispatchMesh(x.min(65_535), 1, 1);
+                                }
+                                self.host_pipeline = plain.as_raw() as usize;
+                                list.keep(plain);
+                            }
+                        }
+                    }
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4165,6 +4210,52 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // One mesh record of a pipeline with the launch stage
+        // (`VICTORY_MESH_LAUNCH=1`): the draw reads the record itself where
+        // the title's passes wrote it (`crate::launch`), with no clamp of
+        // ours and no waits before it.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && p.launch.is_some()
+            && crate::launch::now()
+            && args.offset(arguments).is_multiple_of(4)
+        {
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            // The pipeline bound (made for the bound formats, maybe).
+            let bound =
+                crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats);
+            if let Some(roots) = bound.and_then(|b| b.launch.as_ref()).map(|l| l.roots) {
+                // SAFETY: a live buffer.
+                let base = unsafe { args.buffer.GetGPUVirtualAddress() };
+                let record = base + args.offset(arguments);
+                list.keep(&args.buffer);
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| {
+                    let what = format!("indirect kind {kind} max 1 at {arguments:#x} launched");
+                    self.op_text(what, false)
+                });
+                #[cfg(feature = "diagnostics")]
+                list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+                self.mesh_scissor(list, true);
+                let what = crate::launch::Launch::Record(record);
+                let launched = crate::launch::record(list, roots, what);
+                self.mesh_scissor(list, false);
+                if !launched {
+                    why("no budget for the launch");
+                    return false;
+                }
+                self.drew(list, Some(p));
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            // The pipeline bound has no stage (refused with it): clamped.
+        }
         // Splitting a single record with no count buffer preserves its
         // place in the list and does not read a GPU-written count twice.
         let group_base = if kind == DISPATCH && max == 1 && count.is_none() {
@@ -4278,6 +4369,25 @@ impl State {
         if !ran {
             why("prepare failed");
             return false;
+        }
+        // A mesh call the launch stage does not take (a count buffer, more
+        // than one record, an A/B phase without it): the same pipeline
+        // without the stage, behind the clamp.
+        if kind == MESH
+            && crate::launch::on()
+            && let Some(b) =
+                crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+            && b.launch.is_some()
+        {
+            let Some(plain) = b.plain() else {
+                why("no host pipeline without the launch stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline of the same root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = plain.as_raw() as usize;
+            list.keep(plain);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

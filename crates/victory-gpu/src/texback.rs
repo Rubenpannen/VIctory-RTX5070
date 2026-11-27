@@ -122,6 +122,27 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether the ticket is still valid: the texture's memory has not been
+    /// reused or remapped since it was registered.
+    pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
+}
+
+/// A list wants `resource` copied back when it closes: added to `wanted`
+/// once, and made again if its target there went stale (the title reused or
+/// remapped the memory it tiles into), or the read-back would be dropped as
+/// one of memory the texture no longer holds (the ocean's height map was read
+/// back as nothing). (From fxceless/victory-fork 86d446b7.)
+pub(crate) fn want(wanted: &mut Vec<Target>, resource: This) {
+    match wanted.iter_mut().find(|target| target.owner() == resource as usize) {
+        Some(entry) if !entry.fresh() => {
+            if let Some(target) = Target::new(resource) {
+                *entry = target;
+            }
+        }
+        Some(_) => {}
+        None => wanted.extend(Target::new(resource)),
+    }
 }
 
 /// The readback resources and the allocation the pixels belong to.
