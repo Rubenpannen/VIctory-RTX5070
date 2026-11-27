@@ -245,8 +245,19 @@ pub(crate) fn waiting() -> u64 {
 }
 
 /// Draws and dispatches (direct and indirect) asked of a pipeline left out
-/// on purpose ([`left_out`]), since the last [`take_left_out`].
+/// on purpose ([`left_out`]), and those dropped on purpose before a host
+/// pipeline is asked for ([`note_left_out`]), since the last
+/// [`take_left_out`].
 static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a draw or dispatch dropped on purpose where [`ready`] is not
+/// reached: a stage of the ray-tracing structure builder while it is off,
+/// and in diagnostics builds one of a shader named in
+/// `VICTORY_SKIP_PIPELINES` (dropped by name before its pipeline is asked
+/// for). They were in the frame line's drops but not in its "on purpose".
+pub(crate) fn note_left_out() {
+    LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// See [`LEFT_OUT`] (for the frame line).
 pub(crate) fn take_left_out() -> u64 {

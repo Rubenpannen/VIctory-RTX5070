@@ -333,12 +333,29 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// Whether the structure builder is asked for (`VICTORY_BVH_BUILDER=1`).
+/// Read once.
+#[cfg(windows)]
+fn builder_asked() -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Counts a dropped stage of the structure builder as dropped on purpose
+/// ([`note_left_out`]) if the builder is not asked for; one that is asked for
+/// and rests is a drop like any other.
+#[cfg(windows)]
+pub(crate) fn note_builder_drop() {
+    if !builder_asked() {
+        note_left_out();
+    }
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -498,10 +515,18 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Draws and dispatches asked of pipelines left out on purpose since the
 /// last call (`make::left_out`: `VICTORY_SKIP_PIPELINES`, the ray-tracing
-/// passes without the structure builder).
+/// passes without the structure builder; [`note_left_out`]: the structure
+/// builder's own stages while it is off).
 #[cfg(windows)]
 pub(crate) fn take_left_out() -> u64 {
     make::take_left_out()
+}
+
+/// Counts a draw or dispatch dropped on purpose before its host pipeline is
+/// asked for (`make::note_left_out`).
+#[cfg(windows)]
+pub(crate) fn note_left_out() {
+    make::note_left_out();
 }
 
 /// Shader hashes as printed in the pipeline diagnostics.
