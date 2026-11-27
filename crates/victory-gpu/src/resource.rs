@@ -1491,14 +1491,6 @@ pub(crate) fn has_alias(this: This) -> bool {
 pub(crate) struct Held(This);
 
 #[cfg(windows)]
-impl Held {
-    /// The texture the handle keeps alive.
-    pub(crate) fn get(&self) -> This {
-        self.0
-    }
-}
-
-#[cfg(windows)]
 impl std::ops::Deref for Held {
     type Target = This;
     fn deref(&self) -> &This {
@@ -4805,7 +4797,7 @@ float4 lit() : SV_Target { return 1.0; }
         );
         resource(view).host.placed.store(true, Relaxed);
         let held = alias_of(view).expect("an alias source");
-        assert_eq!(held.get(), source);
+        assert_eq!(*held, source);
         // The title lets go: the pin, not the title's reference, keeps the
         // source alive.
         resource_release(source);
