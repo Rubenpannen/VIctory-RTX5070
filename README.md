@@ -27,9 +27,11 @@ has to plan around:
 | CPU | i9-12900K, 8 fast and 8 slow cores | Ryzen 9 5900X, 12 equal cores over two dies |
 | Driver | AMD | NVIDIA: its own pipeline creation times and shader cache |
 
-## Where it stands on the RTX 5070 (2026-11-26)
+## Where it stands on the RTX 5070 (2026-11-27)
 
-Same scene of the prologue each time; medians of the frame times.
+Medians of the frame times, of the 5-second frame lines with 300 draws a frame or
+more. The first four rows are the same scene of the prologue each time
+(2026-11-26); the last two are longer runs played by hand on 2026-11-27.
 
 | | |
 |---|---|
@@ -37,6 +39,12 @@ Same scene of the prologue each time; medians of the frame times.
 | Copies of single buffer views found under a read lock, their buffers reused (18ae3bd) | 190 ms |
 | On 12 GB cards, title buffers from 1 MiB up (up to 2 GB) kept on the card (a65c925) | 114 ms at 2560x1440, 96 ms at 1920x1080 |
 | 2-minute runs at 1920x1080, `scripts\play.ps1` defaults | 112-138 ms (about 7-9 fps), 125 ms with patch 2 in the same runs |
+| 10 minutes at 1920x1080, the night of 2026-11-26 to 27 | 103 ms (about 10 fps), best line 68 ms |
+| 5 minutes at 1920x1080 after the first part of the VIctory-NVIDIA port (66f54796) | 105 ms, best line 64 ms; the card 41 ms, the wait for it 37 ms |
+
+The ports of 2026-11-27 were fixes first: they did not move the median. The first
+run of a new build is not one to measure: with the shader cache refilling and the
+driver making pipelines, two such runs gave 380 and 713 ms.
 
 The parent's defaults were tuned on a card whose driver makes buffers cheaply; the
 NVIDIA driver takes about a millisecond for each, so anything that makes buffers
@@ -51,14 +59,36 @@ What sets the frame now, at 1920x1080:
   submission, so the submission waits for the card. `VICTORY_PLACED_ORDER=1` ends
   the wait, but the fills then done on the card (about 8,000 a frame) take the
   submitting thread as long (112 -> 132 ms), so it stays off.
-- **The card itself**, about 37 ms a frame, the next wall after that.
+- **The card itself**, about 37-41 ms a frame, the next wall after that.
 
-New on this fork: the 12 GB card-buffer defaults above
-(`VICTORY_CARD_BUFFERS_MIN_MB=16 VICTORY_CARD_BUFFERS_MB=512` restores the parent's),
-and, on by default with `=0` restoring the parent's way, `VICTORY_PLACED_CONSTANTS` and `VICTORY_PLACED_EXACT` (constant buffers and
-copies a copy earlier in the list writes, filled on the card),
-`VICTORY_TEXTURE_VOLATILE` (the intro video no longer jumps back in time),
-`VICTORY_TARGET_VARIANTS` (a pipeline per render-target format a draw really uses).
+New on this fork:
+
+- The 12 GB card-buffer defaults above
+  (`VICTORY_CARD_BUFFERS_MIN_MB=16 VICTORY_CARD_BUFFERS_MB=512` restores the parent's).
+- On by default, with `=0` restoring the parent's way: `VICTORY_PLACED_CONSTANTS` and
+  `VICTORY_PLACED_EXACT` (constant buffers and copies a copy earlier in the list
+  writes, filled on the card), `VICTORY_TEXTURE_VOLATILE` (the intro video no longer
+  jumps back in time), `VICTORY_TARGET_VARIANTS` (a pipeline per render-target
+  format a draw really uses).
+- **The console's 64-lane compute programs run on 32-lane waves** instead of being
+  dropped: the card refuses the 64-lane form, so they take the wave-wide branches,
+  and in groups of several console waves the two host waves of one console wave
+  meet each other alone (`VICTORY_WAVE_WIDE=0`: not). One program whose
+  approximate form hung the card is left out by `scripts\play.ps1`
+  (`VICTORY_SKIP_PIPELINES`).
+- A dispatch whose compute pipeline is not made yet waits for it with a budget of
+  its own (`VICTORY_PIPELINE_COMPUTE_WAIT_MS`), so the title's GPU watchdog no
+  longer ends a run at the intro's first frame.
+- Without ray tracing, reflections are held to the light around
+  (`VICTORY_AMBIENT_REFLECT`), and glass no longer sparkles or draws over what
+  stands in front of it.
+- Fixes and speed work ported by hand on 2026-11-27 from upstream VIctory,
+  avatarmanz, fxceless, Belobug, Kelvaroq and VIctory-NVIDIA (which runs on the
+  same card): shader translation fixes, placed views that no longer leak (16.7 GB
+  after 70 minutes there), TVs, phone calls and reverb that are heard, and for
+  `-RayTracing` the builder's memory. Not all of it has been played yet.
+- The code only an AMD card ran is removed (the RDNA float forms, the 2^21-slot
+  view heap).
 
 ## Where the parent fork stood (2026-11-26, RX 7900 XTX)
 
@@ -151,13 +181,14 @@ target\diag\victory.exe warm --used                     # pipelines earlier runs
 
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+listed in [SWITCHES.md](SWITCHES.md) with its default and values, and described
+in a comment where it is read.
 
 ## What this fork inherits
 
 From the RX 7900 XTX fork; the reasons and the measurements, all of that card,
 are in [docs/findings.md](docs/findings.md). Of its renderer patches only patch 2
-paid on the RTX 5070 (above); the rest are still to be measured one by one.
+paid on the RTX 5070; patches 1, 5, 6 and 7 were measured and removed (above).
 
 - **List calls are written down, not carried out, on the title's threads**
   (`VICTORY_THIN`): eight threads of ours translate them.
@@ -193,6 +224,10 @@ commits taken from elsewhere name the commit and its author.
   cube gradients, sparse textures.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
   the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**
+  (on foxhound's tree, by codec_d and readmet3xt-lab): fixes and speed work for
+  the same card, ported by hand; each commit names its source commits and authors.
+- **Kelvaroq**: fence and texture-range fixes, and the idea behind the mesh launch stage.
 - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
 - **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
   every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's

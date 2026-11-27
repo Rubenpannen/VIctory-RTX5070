@@ -50,6 +50,9 @@ cargo xtask policy                                         # asset-policy check 
   SDK validator rejects `ps_6_6`; point `VICTORY_DXIL` at a current DXC release.
 - `crates/victory-gpu/tests/replay.rs` only builds with `--features diagnostics` and needs a real
   D3D12 adapter; `replay_big.rs` has an `#[ignore]`d test that needs gigabytes of VRAM and disk.
+- A rebuild of the diag binary after a change in `victory-gpu` or `victory-shader` takes 8-10
+  minutes (thin LTO). `.claude/skills/run-victory/smoke.ps1` builds it and checks that the CLI
+  answers (`config`, a read-only `inspect`) without ever starting the title.
 - Formatting: `rustfmt.toml` (max width 100). The workspace lints deny `unsafe_op_in_unsafe_fn`
   and `unused_must_use`; a few clippy style lints are allowed in `Cargo.toml` for this fork.
 
@@ -58,7 +61,10 @@ switches (clearing other `VICTORY_*` vars except the path ones) and runs
 `target\diag\victory.exe run <exe> --execute` from the repo root, where `victory.toml` is looked for.
 `-Safe` drops the newest switches, `-RayTracing` sets `VICTORY_BVH_BUILDER=1`, `-Display` sets
 the title's output size (`VICTORY_OUTPUT`, 2560x1440 by default), `-RenderScale` its upscaler's scale
-(`VICTORY_RENDER_SCALE`, 1.0 by default), `-More @{...}` adds switches. Ahead of a run: `victory shaders <archives>`
+(`VICTORY_RENDER_SCALE`, 1.0 by default), `-Console series-x|series-s` the console the title sees,
+`-Build diag|release` the binary, `-More @{...}` adds switches, and `-Log` / `-LogFile <path>` also
+write the log to a file (under the data folder by default; it holds the title's data, so the script
+refuses a path inside the repo). Ahead of a run: `victory shaders <archives>`
 (translate every shader into the cache) and `victory warm --used` (pre-build host pipelines for the
 driver's cache). Other subcommands (`inspect`, `census`, `translate`, `replay`, `config`, ...) are in
 `apps/victory/src/main.rs`.
@@ -109,7 +115,10 @@ See `docs/architecture.md` for the diagram. The data flow:
   old way, so it can be A/B'd. Debugging switches are compiled in only with the `diagnostics`
   feature. Upstream's list of debugging switches is in `docs/README-fxceless.md`. In `victory-gpu`,
   on/off switches go through `switch::on`, and diagnostics builds can flip switches mid-run with
-  `VICTORY_AB=<seconds>,<switch>,..` (`ab::pick`) to measure both sides in one scene. xtask's test
+  `VICTORY_AB=<seconds>,<switch>,..` (`ab::pick`) to measure both sides in one scene.
+  `SWITCHES.md` is the table of every switch (description, default, values, whether `play.ps1` sets
+  it); it is kept by hand, so add or change its row with the switch (the comment where the switch
+  is read wins where they disagree). xtask's test
   `documented_switches_are_read` fails if a Markdown file names a `VICTORY_*` switch that no Rust
   file reads as a quoted literal of its whole name.
 - Code that approximates the console is marked `shortcut:`.
