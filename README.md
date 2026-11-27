@@ -1,6 +1,6 @@
 # VIctory on an RTX 5070
 
-A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), itself a
+A fork of avatarmanz's VIctory-7900XTX (no longer on GitHub), itself a
 fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that
 runs an Xbox Series title natively on Windows from files the user supplies.
 This one is about **speed on NVIDIA Blackwell, the GeForce RTX 5070**: the world
@@ -185,9 +185,8 @@ commits taken from elsewhere name the commit and its author.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
-- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
-  the fork this one started from, and everything listed under "What this fork
-  inherits".
+- **avatarmanz/VIctory-7900XTX** (no longer on GitHub): the fork this one
+  started from, and everything listed under "What this fork inherits".
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
   that one started from, and the people whose pull requests it carries.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,

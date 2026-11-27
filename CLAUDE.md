@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A fork of VIctory (via avatarmanz/VIctory-7900XTX and fxceless/victory-fork): a compatibility
+A fork of VIctory (via avatarmanz/VIctory-7900XTX, gone from GitHub since 2026-11, and fxceless/victory-fork): a compatibility
 layer that runs an Xbox Series title's x86-64 code unchanged inside our process on Windows,
 supplying the console platform underneath it. This fork's goal is speed on an **NVIDIA RTX 5070
 (12 GB) in a 64 GB PC** (Ryzen 9 5900X; 32 GB of RAM until 2026-11-26, so 12 GB of VRAM and the CPU
