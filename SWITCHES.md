@@ -99,6 +99,8 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_DIRECT_WRITES` | Writes into title memory with the kernel's own call instead of WriteProcessMemory, skipping its slow page query. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_DISPATCH_SPLIT` | Splits over-limit dispatches into pieces for 32-lane GPUs, as an experiment. | off | 1 = on; unset/other = off |
 | `VICTORY_DISPLAY_MODE` | Sets the display size the console reports to the title. | 3840x2160 | &lt;width>x&lt;height> in pixels, 640x360 to 7680x4320; out of range = default |
+| `VICTORY_DSP_CONVOLVE` | Computes the audio DSP's mono convolutions of 1024-frame blocks, so TVs, phone calls and reverb are heard instead of silent. | on | 0 = off (the DSP's outputs are zeros, as before); anything else = on |
+| `VICTORY_DSP_GAIN` | Scales the computed DSP convolutions (the hardware's own scaling is not known). | 2 | &lt;factor, number> |
 | `VICTORY_DSTORAGE_HALF` | Makes a file-streaming queue submit itself once half full, as DirectStorage for PC does. | off | 1 = on; unset/other = off |
 | `VICTORY_DSTORAGE_IO` | Chooses how file-streaming reads files: one handle, a handle per worker, overlapped, or unbuffered. | the built-in default | one = one handle; handles = a handle per worker; overlapped = overlapped reads; direct = unbuffered handle per worker |
 | `VICTORY_DSTORAGE_LOG` | Writes a streaming log with a line per request, file and mapping cost to this file. | off | &lt;file path> to write the streaming log |
@@ -204,6 +206,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_LIST_SLOTS` | Lists the heap slots textures are picked from after draws whose pixel shader matches the given hashes. *Diagnostics build only.* | none | &lt;shader hash prefixes, comma-separated> |
 | `VICTORY_LIST_VIEWS` | Makes a view that a list's tables hold once per list instead of once per table. | on | 0 = off; anything else or unset = on |
 | `VICTORY_LOG` | Sets the log filter for every binary, falling back to RUST_LOG. | info (debug builds of tools may differ) | &lt;tracing filter>, e.g. victory_loader=trace,info; falls back to RUST_LOG |
+| `VICTORY_LOW_EARLY_MB` | Reserves this much address space in [4 GiB, 2^37) at host creation, in 64 MiB pieces, for the ray-tracing builder's memory arenas. | 3200 with `VICTORY_BVH_BUILDER=1`, else 0 | &lt;megabytes, integer>; 0 = none reserved |
 | `VICTORY_MAPPED_BY_PAGE` | Measures how much title memory is mapped one 4 KiB page at a time, without walking ranges. | off | 1 = on; unset or anything else = off |
 | `VICTORY_MAPPED_BY_VIEWS` | Asks the runtime's own views of physical pages how much title memory is mapped before asking Windows. | on | 0 = off; anything else or unset = on |
 | `VICTORY_MAP_LEAN` | Makes a mapping change ask the host only for what it needs, skipping redundant splits and commits. | on | 0 = off; anything else or unset = on |
@@ -222,6 +225,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_ONE_PAD` | Shows the title one always-present pad fed by the keyboard and every host pad. | on | 0 = each host pad shown separately; anything else or unset = one always-present pad |
 | `VICTORY_OPEN_ONE_VIEW` | Opens only the written view on a write fault and leaves the page's other views read-only. | on | 0 = off; anything else or unset = on |
 | `VICTORY_OUTPUT` | Sets the title's output size by patching its display mode. *Set by `scripts\play.ps1`.* | not set (title's own) | &lt;width>x&lt;height>: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160 |
+| `VICTORY_OWNERLESS_VIEWS` | Caps how many table entries of views without a resource are kept; past it the oldest is freed (stops a memory leak in long sessions). | 1048576 | &lt;entries, integer>; 0 = keep all, as before |
 | `VICTORY_PAGE_PARTS` | Copies only the 4 KiB parts of a page the kernel says were written, not the whole 64 KiB page. | on | 0 = off; anything else or unset = on |
 | `VICTORY_PAGE_WRITES` | Chooses what happens when title memory is written without the page guards noticing: reopen guarded host copies and/or mark texture slots due. | 1 (guarded blocks reopened) | 0 = count only; 1 = blocks and texture slots; slots = texture slots only; all = everything; guards/unset/other = blocks only |
 | `VICTORY_PAIRS` | In the offline shader translation walk, keeps the named vertex+pixel shader pairs (label substrings) so their pipelines are built afterwards. | none | comma-separated vs+ps pairs of label substrings |

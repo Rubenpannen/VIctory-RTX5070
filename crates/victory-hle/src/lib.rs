@@ -32,6 +32,10 @@ pub use victory_gpu::pipeline::known as known_pipelines;
 /// Renderer port #2's switch and marks, for the launcher.
 #[cfg(windows)]
 pub use victory_gpu::port_descriptors;
+/// The address space for memory shaders read by address, for `main` to
+/// reserve first thing (from VIctory-NVIDIA e69e39c).
+#[cfg(windows)]
+pub use victory_gpu::reserve_upload_space;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

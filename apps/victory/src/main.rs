@@ -180,6 +180,12 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // Before anything else can take the address space it needs: on players'
+    // PCs [4 GiB, 2^37) was full by the first ray-traced frame and the title
+    // ended with "Failed to allocate upload buffer" (from VIctory-NVIDIA
+    // e69e39c, trustno1-coder). Address space only; nothing is committed.
+    #[cfg(windows)]
+    victory_hle::reserve_upload_space();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
