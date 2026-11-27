@@ -192,19 +192,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        if p.graphics.is_none() && !p.shaders.is_empty() && compute_waits() {
-            // Made here, or waited for while a worker makes it.
-            p.make();
-        } else {
-            wait(p, crate::frame::current());
-        }
+        wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
 }
 
-/// Whether a dispatch waits for its compute pipeline until it is made,
-/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
-/// the budget and is dropped while its pipeline is not there.
+/// Whether a dispatch waits for its compute pipeline with a budget of its
+/// own ([`compute_budget`]) instead of the frame's ([`wait_budget`]); a draw
+/// still waits within the frame's budget and is dropped while its pipeline
+/// is not there.
 ///
 /// A dropped draw is drawn again in the next frame. A dropped dispatch may
 /// not be: the title runs some compute passes once, when a scene changes
@@ -214,11 +210,30 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// the room before stayed blended over the whole picture for minutes
 /// (fxceless's run 195). A wait of seconds once (the pipeline library has
 /// it on the next run) against a picture wrong until the scene ends.
-/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
-/// before.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the frame's
+/// budget, as before.
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// Waiting allowed per title frame for compute pipelines, over all threads
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT_MS`, 5 s). Without a bound, each dispatch
+/// made its pipeline on the recording thread: at the intro's first frame,
+/// with hundreds of pipelines behind and each compute pipeline taking about
+/// 1.2 s to make, no frame went out for 34 s and the title's GPU watchdog
+/// ended the run ("GPU Loc Sig", an unsignalled cross-queue barrier; RTX 5070,
+/// 2026-11-27). With the screen passes' 10 s and the frame's half second, a
+/// frame waits at most 15.5 s, below the watchdog's 30 s.
+fn compute_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(5_000);
+        Duration::from_millis(millis)
+    })
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.
@@ -309,14 +324,22 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
+    let compute = p.graphics.is_none() && !p.shaders.is_empty() && compute_waits();
+    // Which budget: the frame's, the passes over the screen's, the dispatches'.
+    let (kind, budget) = if screen {
+        (1, screen_budget())
+    } else if compute {
+        (2, compute_budget())
+    } else {
+        (0, wait_budget())
+    };
     if budget.is_zero() {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
-    let spent_of = &SPENT[usize::from(screen)];
+    // taken by a thread waiting now); for each budget.
+    static SPENT: [Mutex<(u64, Duration)>; 3] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 3];
+    let spent_of = &SPENT[kind];
     let shared = shared_budget();
     let left = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
