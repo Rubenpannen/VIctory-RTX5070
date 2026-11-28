@@ -98,7 +98,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            // One with no host pipeline was left out (a pipeline the run's
+            // switches leave out, such as `CS_RaytracingResolve` without the
+            // structure builder) or refused: not done, so that a warm with
+            // other switches still makes it. (From VIctory-NVIDIA 5ed66db,
+            // Yorivel.)
+            if there {
+                let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            }
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);

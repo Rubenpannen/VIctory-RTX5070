@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -3928,6 +3928,49 @@ fn land() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn host_fence_completion_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
+/// Whether a fence's completed value shows `target` run. `u64::MAX` is not
+/// a value the card reaches: it is what `GetCompletedValue` answers when the
+/// device is gone.
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Waits for `target` on `fence` and reports what went wrong instead of
+/// carrying on: a failed wait used to fall through to the landing step with
+/// nothing run, settling flights off an unsent fence value, and a lost
+/// device (a completed value of `u64::MAX`) made every wait pass at once.
+///
+/// # Safety
+///
+/// `event` is the calling thread's own, never closed while it waits.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: the caller's fence and event, alive for the whole wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        fail(format_args!(
+            "{context}: SetEventOnCompletion({target}) failed: {e}"
+        ));
+    }
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!(
+            "{context}: fence {completed} did not reach {target}"
+        ));
+    }
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3967,14 +4010,10 @@ fn late_helper() {
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
+        #[cfg(feature = "diagnostics")]
+        let _card = crate::timeline::card_wait(Some(target));
         // SAFETY: our fence and event.
-        unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
-        }
+        unsafe { wait_host_fence(&host.fence, target, event, "late helper") };
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Something newer went up meanwhile: the card is waited for
@@ -4132,14 +4171,7 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -10850,8 +10882,36 @@ impl Host {
     }
 }
 
+/// The property our hook of the title's window procedure puts on the
+/// windows the title makes (`TITLE_PROC` in `victory_hle::modules::lifecycle`).
+const TITLE_HOOK: PCWSTR = w!("victory.wndproc");
+
+/// A visible top-level window of this process, as [`title_window`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Candidate {
+    hwnd: usize,
+    /// Carries [`TITLE_HOOK`]: a window the title made.
+    hooked: bool,
+    /// Its client area is not empty.
+    sized: bool,
+}
+
+/// Which of `candidates` (in z-order, topmost first) is the title's: the
+/// one our hook marked, else the first with a client area. Pure, for testing.
+fn pick_title_window(candidates: &[Candidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .find(|c| c.hooked)
+        .or_else(|| candidates.iter().find(|c| c.sized))
+        .map(|c| c.hwnd)
+}
+
 /// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// it made one. Not simply the first visible one: started under a
+/// pseudoconsole (from Windows Terminal, or by a process that has one), this
+/// process also owns a visible `PseudoConsoleWindow` of 0x0 pixels. When
+/// that one was above the title's window in z-order, the swap chain was made
+/// for it, and the title's window stayed white with no frame ever shown.
 fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
@@ -10861,16 +10921,59 @@ fn title_window() -> Option<HWND> {
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
             {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+                let mut area = RECT::default();
+                let sized = GetClientRect(hwnd, &mut area).is_ok() && area.right > area.left && area.bottom > area.top;
+                let hooked = !GetPropW(hwnd, TITLE_HOOK).0.is_null();
+                (*(found.0 as *mut Vec<Candidate>)).push(Candidate { hwnd: hwnd.0 as usize, hooked, sized });
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
-    // SAFETY: the callback only writes `found`, which outlives the call.
+    let mut found: Vec<Candidate> = Vec::new();
+    // SAFETY: the callback only adds to `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
+    let picked = pick_title_window(&found);
+    if !found.iter().any(|c| c.hooked) {
+        tracing::info!(
+            windows = found.len(),
+            "no window of the title's among ours: presenting to the first with a client area, if any"
+        );
+    }
+    picked.map(|hwnd| HWND(hwnd as *mut _))
+}
+
+#[cfg(test)]
+mod title_window_tests {
+    use super::{Candidate, pick_title_window};
+
+    fn window(hwnd: usize, hooked: bool, sized: bool) -> Candidate {
+        Candidate { hwnd, hooked, sized }
+    }
+
+    /// A pseudoconsole's 0x0 window above the title's in z-order.
+    #[test]
+    fn the_titles_window_wins_over_a_pseudo_console_above_it() {
+        let found = [window(1, false, false), window(2, true, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn the_titles_window_counts_even_while_its_client_area_is_empty() {
+        let found = [window(1, false, true), window(2, true, false)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn without_one_of_the_titles_the_first_with_a_client_area() {
+        let found = [window(1, false, false), window(2, false, true), window(3, false, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn a_pseudo_console_alone_is_no_window_to_present_to() {
+        assert_eq!(pick_title_window(&[window(1, false, false)]), None);
+        assert_eq!(pick_title_window(&[]), None);
+    }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
