@@ -120,9 +120,11 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_DSTORAGE_HALF` | Makes a file-streaming queue submit itself once half full, as DirectStorage for PC does. | off | 1 = on; unset/other = off |
 | `VICTORY_DSTORAGE_IO` | Chooses how file-streaming reads files: one handle, a handle per worker, overlapped, or unbuffered. | the built-in default | one = one handle; handles = a handle per worker; overlapped = overlapped reads; direct = unbuffered handle per worker |
 | `VICTORY_DSTORAGE_LOG` | Writes a streaming log with a line per request, file and mapping cost to this file. | off | &lt;file path> to write the streaming log |
+| `VICTORY_DSTORAGE_PRIORITY` | Sets the thread priority of the workers that unpack the title's streamed files, so that below normal they take the processors nobody of the frame wants. | 0 (normal) | &lt;-2 to 2>; 0 = normal |
 | `VICTORY_DSTORAGE_RETRIES` | Sets how many times a streaming write into not-yet-ready pages is retried before the request fails. | 12 | &lt;retries, integer>; waits grow from 2 ms to 128 ms |
 | `VICTORY_DSTORAGE_STAGING_MB` | Raises the streaming staging buffer to at least this many MiB, above what the title asks for. | 0 (what the title asks for) | &lt;MiB, integer>; staging buffer is at least this big |
 | `VICTORY_DSTORAGE_TRACE` | Traces the streaming system: per batch and unexpected changes, or per request. | 0 (off) | 0 = off; 1 = line per batch and per faulty request; 2 = line per request |
+| `VICTORY_DSTORAGE_WORKERS` | Sets how many threads unpack the title's streamed files. | one per logical processor | &lt;threads, integer > 0> |
 | `VICTORY_DUALSENSE` | Reads PlayStation pads (DualShock 4, also through the 0x0BA0 adapter; DualSense; DualSense Edge) over HID, USB or Bluetooth, with rumble; looked for every 2 seconds while no XInput pad is there. | auto (only while XInput lists no pad) | 0 = never; 1 = beside XInput pads too; unset = auto |
 | `VICTORY_DUMP_MATCH` | Dumps shader containers whose description line contains one of the texts to a folder, as the title has them. | off | &lt;folder>;&lt;text> or several texts separated by a vertical bar; a text is a name or #hash |
 | `VICTORY_DUMP_TARGETS` | Saves the title textures that captured frames render to or write, in first-use order. *Diagnostics build only.* | off | on when set and not 0; needs VICTORY_CAPTURE |
@@ -267,6 +269,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_PAIR_LDS_ORDER` | No pair meeting around LDS accesses whose order does not matter. Changes translations. | on | 0 = a meeting before every LDS access, as before; anything else = on |
 | `VICTORY_PAIR_REGIONS` | With pair meetings, loop branches get their own lane region, and title barriers inside wave-wide branches become fences only when `VICTORY_GROUP_SYNC=1` (otherwise they still wait for the group). Changes translations. | on | 0 = as before; anything else = on |
 | `VICTORY_PANEL` | Draws the run's numbers as white text on a black box in the picture's upper-left corner; F3 shows or hides it. In every build; F3 or the F1 menu turn it on and off while the title runs. | off | 0 or unset = off; anything else = on (F3 shows/hides) |
+| `VICTORY_PASSES_HOT` | Wakes the helper threads at each submission's start and keeps an idle one awake for up to this many microseconds after the last work, so a pass finds them awake; long values keep cores spinning. | 0 (off) | &lt;microseconds, integer>; 0 = off |
 | `VICTORY_PATCH_CLZERO` | Replaces each faulting cache-zeroing loop in the title's code with plain stores the first time it faults, so it stops raising exceptions. | on | 0 = off; anything else = on |
 | `VICTORY_PATCH_WAITS` | Replaces the title's console wait instructions (monitorx/mwaitx) with harmless ones the first time they fault, instead of emulating them each time. | on | 0 = off; anything else = on |
 | `VICTORY_PC_DXC` | Path to the PC dxc.exe used to compile the helper shaders the host builds itself; otherwise it is looked for beside dxil.dll. | dxc.exe beside the validator's dxil.dll | &lt;path to dxc.exe> |
@@ -480,6 +483,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_WIDE_REFRESH` | Runs a submission's refreshes of host copies on several threads, one copy per thread. | automatic from the core count | 0 = off; 1 = force on; unset/other = automatic |
 | `VICTORY_WIDE_SPIN` | Lets worker threads wait awake for up to this many microseconds before sleeping. | 0 (sleep, no spinning) | &lt;microseconds, integer>; 0 = do not spin |
 | `VICTORY_WIDE_TEXTURES` | Brings a submission's textures up to date on several threads. | on (needs WIDE_REFRESH on) | 0 = off; anything else = on |
+| `VICTORY_WIDE_THREADS` | Sets how many helper threads are kept for refreshes on several threads. | a quarter of the logical processors, 2 to 6 | &lt;threads, integer>, clamped to 1-32 |
 | `VICTORY_WINDOWS_BAR_MB` | Caps the bytes of memory windows kept in the card's memory and filled by the CPU over the bus. | 0 (none) | &lt;megabytes, integer> |
 | `VICTORY_WINDOWS_OWN` | Gives windows outside buffers a second side, so in-flight submissions read the bytes they were prepared with. | off | 1 = on; unset/other = off |
 | `VICTORY_WINDOW_BUDGET_MB` | Caps loose title-window copies in the watch and high-RAM memory bands. | none (no cap) | &lt;megabytes, integer>; 0 = no cap |
