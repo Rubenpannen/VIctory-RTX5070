@@ -440,6 +440,8 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    // (Nothing without `VICTORY_BUFFERS_AHEAD`.)
+    crate::ahead::want_card();
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
@@ -478,7 +480,10 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    // (one made ahead, if it is of that size and one is in store: `crate::ahead`,
+    // `VICTORY_BUFFERS_AHEAD`; never without that switch)
+    let ahead = if size == crate::ahead::SIZE { crate::ahead::card() } else { None };
+    let buffer = ahead.or_else(|| host.uav_buffer(size));
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }

@@ -17,6 +17,8 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_AB` | Flips the listed switches on and off by turns while the title runs, measuring both settings in one scene. *Diagnostics build only.* | off | &lt;seconds, number > 1>,&lt;switch name>,... (1 to 8 switches); the named switches flip every period |
 | `VICTORY_ALIAS_COPY` | Lets a copy aimed at a texture that views another texture's memory reuse that texture instead of making a new one. | on | 0 = off; anything else = on |
 | `VICTORY_ALLOCATOR_RENEW` | Replaces a host command list's allocator with a fresh one at reset once it recorded more than this many calls. | 512 | &lt;calls, integer>; 0 = never renew |
+| `VICTORY_ALLOCATOR_TRIM` | Replaces a host list's (and its prelude's) command allocator at reset once it is `VICTORY_ALLOCATOR_TRIM_S` old, destroys idle pooled lists not taken for that long, and frees spare scratch chunks nobody took, so memory a heavy frame's commands took is given back. | off | 1 = on; unset/other = off |
+| `VICTORY_ALLOCATOR_TRIM_S` | Sets the age, in seconds, at which `VICTORY_ALLOCATOR_TRIM` replaces an allocator or destroys an idle list. | 30 | &lt;seconds, integer>, clamped to 5-3600; needs VICTORY_ALLOCATOR_TRIM=1 |
 | `VICTORY_AMBIENT` | Turns on the stand-in for ray-traced indirect light, estimated from the frame or a constant level, while the ray-tracing builder is off. *Set by `scripts\play.ps1`.* | off | &lt;level, number> = estimate from the frame; constant:&lt;level> = fixed level; unparseable = off |
 | `VICTORY_AMBIENT_AIR` | Caps how much the air scatters light in the ambient stand-in, as a multiple of the light around. | the title's own | &lt;multiple, number > 0>; 0 or unparseable = the title's own |
 | `VICTORY_AMBIENT_REFLECT` | Caps how bright a reflection may get in the ambient stand-in, as a multiple of the light around. | built-in cap | &lt;multiple, number>; 0 or off = the title's own |
@@ -47,6 +49,8 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_BIND_CACHE` | Skips setting render targets and depth on the host list again when they are the same as already set. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_BLOCK_WAY` | Benchmark test only: which way of making new texture blocks to run (one per process). | not set (test only) | one of: made; waited; enqueued; fresh-made; fresh-waited; fresh-enqueued; never |
 | `VICTORY_BOOK` | Keeps a log of descriptor and memory ownership to name the cause of a device loss. *Diagnostics build only.* | on, but only active when device-removed data or checks are on | 0 = off; anything else (or unset) = on |
+| `VICTORY_BUDGET_PACK` | Makes a list's mapped indirect budget a 256-byte slot of a shared 64 KiB buffer instead of a 64 KiB buffer of its own. | off | 1 = on; unset/other = off |
+| `VICTORY_BUFFERS_AHEAD` | Has a low-priority thread make this many 64 KiB buffers (CPU-mapped, and card ones once wanted) ahead of the title's need, keeping up to 1024 in store afterwards. | 0 (none; every buffer is made when asked for) | &lt;count, integer>, at most 16384 |
 | `VICTORY_BURY_LAG` | Sets how many submissions later than possible a released object is dropped and a run host list is reset. | 16 on a PC with limited RAM, else 64 | &lt;submissions, integer>; 0 = no lag |
 | `VICTORY_BVH_BOUNDS` | Keeps the ray-tracing structure builder's accesses near their root views and treats an impossible size in a header as none. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_BVH_BUILDER` | Lets the translated ray-tracing structure builder run, so rays can find geometry. *Set by `scripts\play.ps1`.* | off | 1 = on; unset/other = off |
@@ -227,6 +231,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_LIGHT_PROBE_LUX` | Also records the lux program's inputs and outputs in the light probe. | off | 1 = on; unset or anything else = off |
 | `VICTORY_LIGHT_REFRESH` | Refreshes host copies the light way, skipping view memory that nothing wrote since it was last asked. | on | 0 = off; anything else or unset = on |
 | `VICTORY_LIST_POOL` | Reuses host command lists that have run instead of making each new and discarding it. | on | 0 = off; anything else or unset = on |
+| `VICTORY_LIST_POOL_IDLE_S` | Destroys an idle pooled list, with its command allocators, once nobody took it for this many seconds. | not set (never; with `VICTORY_ALLOCATOR_TRIM=1` its time) | &lt;seconds, integer > 0> |
 | `VICTORY_LIST_SLOTS` | Lists the heap slots textures are picked from after draws whose pixel shader matches the given hashes. *Diagnostics build only.* | none | &lt;shader hash prefixes, comma-separated> |
 | `VICTORY_LIST_VIEWS` | Makes a view that a list's tables hold once per list instead of once per table. | on | 0 = off; anything else or unset = on |
 | `VICTORY_LOG` | Sets the log filter for every binary, falling back to RUST_LOG. | info (debug builds of tools may differ) | &lt;tracing filter>, e.g. victory_loader=trace,info; falls back to RUST_LOG |
@@ -285,6 +290,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_POKE` | Writes the given byte at each listed offset of the title's image twice a second, e.g. to keep a main-loop flag alive. *Diagnostics build only.* | none | &lt;hex rva>:&lt;hex byte>, comma-separated |
 | `VICTORY_POOL_RECLAIM` | Frees empty 64 MiB texture blocks as soon as video memory use reaches 85 % of budget, even without the residency switch. | on | 0 = off; anything else = on |
 | `VICTORY_POOL_SMALL` | Places textures of 64 KiB and less at 4 KiB multiples inside their block, where the host allows, not 64 KiB multiples. | off | 0 or unset = off; anything else = on |
+| `VICTORY_POOL_STATS` | Logs every five seconds what the texture blocks hold: how full they are, how their free bytes lie, textures by piece size, and what small ones would hold at 4 KiB multiples (one more question of the host per texture made). | off | 1 = on; unset/other = off |
 | `VICTORY_POP_ALL` | With the pop watcher, saves every watched frame's small picture instead of only the frames around detected blips. *Diagnostics build only.* | off | 1 = on; unset/anything else = off |
 | `VICTORY_POP_FOLDER` | Folder where the pop watcher saves the 640-pixel-wide pictures around frames that show blips (at most 200). *Diagnostics build only.* | none (nothing saved) | &lt;existing or creatable folder path> |
 | `VICTORY_POP_WATCH` | Reads back presented frames in the given time windows and compares neighbours to count popping textures (blips, steps, lone blocks). *Diagnostics build only.* | none (off) | &lt;from>-&lt;to> in seconds since start, comma-separated windows |
@@ -359,6 +365,10 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_SKIP_CPU_CHECK` | Lets the title start on a CPU without AVX2, which the startup check would otherwise refuse (e.g. under CPU emulation). | off (AVX2 required) | 1 = skip the check; anything else = checked |
 | `VICTORY_SKIP_PIPELINES` | Leaves out pipelines of the listed shader hashes so their draws and dispatches are dropped. *Set by `scripts\play.ps1`.* | none | &lt;16-digit hex shader hashes, comma-separated> |
 | `VICTORY_SLOT_CHECK` | Runs a thread that walks the view heap and reports slots naming memory that is already gone. *Diagnostics build only.* | off | 0 or unset = off; anything else = on |
+| `VICTORY_SLOT_EVICT` | Under pressure on the card's memory, lets go of idle host copies of title-filled textures although title slots a table showed still name them; the slots show nothing until the title uses the texture again. | off | 1 = on; unset/other = off |
+| `VICTORY_SLOT_EVICT_LOW_PERCENT` | Sets the share of the card's budget under which `VICTORY_SLOT_EVICT` stops evicting. | the high percent less 10 | &lt;percent, integer>, clamped to 40 .. high less 1 |
+| `VICTORY_SLOT_EVICT_MB` | Caps the bytes `VICTORY_SLOT_EVICT` lets go in one sweep. | 256 | &lt;MiB, integer>, clamped to 16-2048 |
+| `VICTORY_SLOT_EVICT_PERCENT` | Sets the share of the card's budget above which `VICTORY_SLOT_EVICT` starts evicting. | 85 | &lt;percent, integer>, clamped to 50-97 |
 | `VICTORY_SLOT_HOLDS` | Makes a descriptor slot hold the host memory of a constant buffer view it points at, not only the list. | on | 0 = off; anything else = on |
 | `VICTORY_SNAPSHOT_POOL` | Sets how many snapshot buffers of copies in PC memory are kept for reuse. | 1024 | &lt;buffers kept, integer> |
 | `VICTORY_SPANS_QUICK` | Lets a slot write of no placed texture view leave the heap's placed-spans set alone when the slot is not in it. | on | 0 = off; anything else = on |
@@ -443,6 +453,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_VIEW_INLINE` | Names constant buffer and placed-memory views whole in their records instead of as table entries. | on | 0 = off; anything else = on |
 | `VICTORY_VIEW_LIMIT` | Makes the offline translate command translate as for a host whose view heap is capped at this null slot. | not set | &lt;view heap slot number, integer> |
 | `VICTORY_VIEW_THREADS` | Sets how many threads make descriptors for index-picked views (records use a separate larger pool). | 4 (6 for records) | &lt;thread count, integer>; clamped to 1-16; 1 = on the calling thread alone |
+| `VICTORY_VRAM_BUDGET_MB` | Caps what is taken as the card's memory budget, whatever the system gives; the texture line, card copies of title buffers and the render-target reserve are all sized from it. | not set (the system's budget) | &lt;MiB, integer>; at least 2048 |
 | `VICTORY_WAIT_ASK` | Asks Windows whether a fence value's memory is committed before reading it. | off | 1 = on; unset/other = off |
 | `VICTORY_WAIT_FORCE` | Makes a present run work queues still hold, so a wait is not held across frames. | on | 0 = off; anything else = on |
 | `VICTORY_WAIT_RESIDENT` | Makes new memory resident and waits for it before anything can name it, avoiding page faults on the card. | on | 0 = off; anything else = on |

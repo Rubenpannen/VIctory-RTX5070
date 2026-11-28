@@ -991,7 +991,10 @@ fn log_memory() {
          views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
          made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
          lists were made, {} allocators renewed after long recordings \
-         (VICTORY_ALLOCATOR_RENEW); twins of depth textures: {:.0} MB; host copies of \
+         (VICTORY_ALLOCATOR_RENEW), {} of lists and {} of preludes renewed for their age \
+         (VICTORY_ALLOCATOR_TRIM=1), {} idle lists destroyed (VICTORY_LIST_POOL_IDLE_S), \
+         {:.0} MB of spare scratch chunks nobody took let go; twins of depth textures: \
+         {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
          let go from memory so far: {:.0} MB; our own blocks of 32 MB and more, in MB: {}",
@@ -1004,6 +1007,10 @@ fn log_memory() {
         lists[1],
         lists[2] as i64 as f64 / (1 << 20) as f64,
         crate::host::LISTS_RENEWED.load(Relaxed),
+        crate::host::ALLOCATOR_TRIMS[0].load(Relaxed),
+        crate::host::ALLOCATOR_TRIMS[1].load(Relaxed),
+        crate::list::TRIMMED_LISTS.load(Relaxed),
+        mb(crate::host::SPARE_TRIMMED.load(Relaxed)),
         mb(census[7]),
         mb(census[8]),
         mb(census[9]),

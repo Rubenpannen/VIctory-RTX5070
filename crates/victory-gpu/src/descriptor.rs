@@ -1542,6 +1542,85 @@ pub(crate) fn make_waiting() {
     }
 }
 
+/// For `crate::resource::slot_evict` (`VICTORY_SLOT_EVICT=1`): of the host textures `raws` (raw
+/// pointer to title texture), those shown only by title slots a draw makes
+/// again by itself (`HostHeap::slots_showing`), with those slots as (heap,
+/// index). A texture any other slot shows is left out (the third result
+/// counts them). So is one any of whose slots a draw's table showed after
+/// frame `cutoff` (the second result counts them): a texture drawn through
+/// a table every frame never asks for its host copy again, so its last use
+/// is old although it is on screen.
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn evictable_slots(
+    raws: &std::collections::HashMap<usize, usize>,
+    frame: u64,
+    cutoff: u64,
+) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64) {
+    let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
+    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
+    let mut blocked = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    {
+        // (The heaps stay while the lock is held: `mirror`.)
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: a registered heap, live while the lock is held.
+            let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
+                continue;
+            };
+            for (index, raw, ok, lately) in host.slots_showing(&set, frame, cutoff) {
+                if lately {
+                    seen.insert(raw);
+                }
+                if ok {
+                    by_texture.entry(raw).or_default().push((at, index));
+                } else {
+                    blocked.insert(raw);
+                }
+            }
+        }
+    }
+    let kept = seen.iter().filter(|raw| !blocked.contains(raw)).count() as u64;
+    by_texture.retain(|raw, _| !blocked.contains(raw) && !seen.contains(raw));
+    (
+        by_texture.into_iter().filter_map(|(raw, slots)| Some((*raws.get(&raw)?, slots))).collect(),
+        kept,
+        blocked.len() as u64,
+    )
+}
+
+/// Puts the slots of title texture `resource` back to waiting for its host
+/// copy ([`evictable_slots`]): null now, made again when the texture is
+/// ([`make_waiting`]) or after the draw that reads them through a table.
+/// Returns how many were made. Called before the host copy is let go.
+#[cfg(windows)]
+pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
+    let mut n = 0;
+    for &(at, index) in slots {
+        // (The heap stays while the lock is held: `mirror`.)
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        if !heaps.iter().any(|&(_, _, h)| h == at) {
+            continue;
+        }
+        // SAFETY: a registered heap, live while the lock is held.
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(handle), Some(Some(host))) = (heap.handle(index), heap.host.get()) else {
+            continue;
+        };
+        if host.texture_slot_evicted(index) {
+            drop(heaps);
+            let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+            let handles = waiting.entry(resource).or_default();
+            if !handles.contains(&handle) {
+                handles.push(handle);
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
