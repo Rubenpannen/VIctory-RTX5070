@@ -8,8 +8,7 @@ comment where a switch is read disagree, the comment is right.
 - **Diagnostics build only**: the switch exists only in a build with `--features diagnostics`
   (`target\diag`); a release build ignores it.
 - **Set by `scripts\play.ps1`**: the launcher sets it (some only with `-Safe`, `-RayTracing`,
-  `-Display` or `-RenderScale`); `-More @{...}` overrides it. `-NvidiaDefaults` sets more, which
-  their rows do not say: the list is in the script.
+  `-Display` or `-RenderScale`); `-More @{...}` overrides it.
 - **Test only / build time**: read only by tests, or stamped in when building; not a switch to set
   when playing.
 
@@ -21,7 +20,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_ALLOCATOR_TRIM` | Replaces a host list's (and its prelude's) command allocator at reset once it is `VICTORY_ALLOCATOR_TRIM_S` old, destroys idle pooled lists not taken for that long, and frees spare scratch chunks nobody took, so memory a heavy frame's commands took is given back. | off | 1 = on; unset/other = off |
 | `VICTORY_ALLOCATOR_TRIM_S` | Sets the age, in seconds, at which `VICTORY_ALLOCATOR_TRIM` replaces an allocator or destroys an idle list. | 30 | &lt;seconds, integer>, clamped to 5-3600; needs VICTORY_ALLOCATOR_TRIM=1 |
 | `VICTORY_AMBIENT` | Turns on the stand-in for ray-traced indirect light, estimated from the frame or a constant level, while the ray-tracing builder is off. *Set by `scripts\play.ps1`.* | off | &lt;level, number> = estimate from the frame; constant:&lt;level> = fixed level; unparseable = off |
-| `VICTORY_AMBIENT_AIR` | Caps how much the air scatters light in the ambient stand-in, as a multiple of the light around. | the title's own | &lt;multiple, number > 0>; 0 or unparseable = the title's own |
+| `VICTORY_AMBIENT_AIR` | Caps how much the air scatters light in the ambient stand-in, as a multiple of the light around. *Set by `scripts\play.ps1`.* | the title's own | &lt;multiple, number > 0>; 0 or unparseable = the title's own |
 | `VICTORY_AMBIENT_REFLECT` | Caps how bright a reflection may get in the ambient stand-in, as a multiple of the light around. | built-in cap | &lt;multiple, number>; 0 or off = the title's own |
 | `VICTORY_AMBIENT_SETTLE` | Sets how slowly the ambient light's running average follows the frames, so light does not pop in. | 250 ms, jump factor 3, fresh 0 s | &lt;time constant ms>[,&lt;jump factor>[,&lt;fresh seconds>]]; 0 = old fixed per-frame blend |
 | `VICTORY_AMBIENT_SHADE` | Sets the strength and radius of the darkening in creases and corners added by the ambient stand-in. | strength 1.0, radius 0.6 m | &lt;strength>,&lt;radius in metres>; either part may be omitted |
@@ -71,7 +70,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_CARD_AWAKE` | Keeps the card's clocks up between submissions so it does not idle during frames. *Set by `scripts\play.ps1`.* | off | 1 = on; turns = alternate on and off; other = off |
 | `VICTORY_CARD_BUFFERS` | Keeps host copies of big title buffers in the card's own memory. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_CARD_BUFFERS_MB` | Sets the largest title buffer, in MiB, that gets a copy in the card's memory. | chosen from the adapter's VRAM budget | &lt;MiB, integer>; largest buffer given a card copy |
-| `VICTORY_CARD_BUFFERS_MIN_KB` | Sets the smallest title buffer, in KiB, that gets a card-memory copy; can go under 1 MiB. | not set (MIN_MB or the VRAM budget decides) | &lt;KiB, integer > 0>; smallest buffer given a card copy |
+| `VICTORY_CARD_BUFFERS_MIN_KB` | Sets the smallest title buffer, in KiB, that gets a card-memory copy; can go under 1 MiB. *Set by `scripts\play.ps1`.* | not set (MIN_MB or the VRAM budget decides) | &lt;KiB, integer > 0>; smallest buffer given a card copy |
 | `VICTORY_CARD_BUFFERS_MIN_MB` | Sets the smallest title buffer, in MiB, that gets a copy in the card's memory. | chosen from the adapter's VRAM budget | &lt;MiB, integer>; smallest buffer given a card copy |
 | `VICTORY_CARD_HASH_LEN` | Limits the card's hashes of a buffer copy to the title buffer's own size rounded to 16 bytes. | on | 0 = hash the whole card buffer; anything else (or unset) = own size rounded to 16 bytes |
 | `VICTORY_CARD_REHASH_RUNS` | Hashes pieces re-hashed after ranges are sent up in runs of touching pieces, so each is hashed once. *Set by `scripts\play.ps1`.* | off | 1 = on; unset/other = off |
@@ -173,7 +172,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_HEAP_SYNC` | Mirrors changed descriptor heap pages into the host heap before lists are sent to the queue. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HEAP_SYNC_ASIDE` | Does a submission's descriptor heap sync on its own thread beside the rest of the preparing. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HEAP_SYNC_EARLY` | Sets how long the heap sync thread waits for a submission before making a round of its own. | 4 | &lt;milliseconds, integer>; 0 = none |
-| `VICTORY_HEAP_SYNC_FIRST` | Starts a submission's round of the heaps' records as soon as it holds the submission lock. | off | unset or 0 = off; anything else = on |
+| `VICTORY_HEAP_SYNC_FIRST` | Starts a submission's round of the heaps' records as soon as it holds the submission lock. *Set by `scripts\play.ps1`.* | off | unset or 0 = off; anything else = on |
 | `VICTORY_HEAP_TEXTURES` | Uploads textures placed in memory that is not fully mapped yet with what is there, and re-checks them later. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HELD_LEVELS` | Reads, keeps and uploads a placed texture only from the first mip level its views actually show. | on | 0 = off; anything else or unset = on |
 | `VICTORY_HELPER_OWN` | Makes a pixel shader's helper lane read its own value where the console reads the first lane's. | on | 0 = off; anything else or unset = on |
@@ -298,12 +297,12 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_PORT_DESCRIPTORS` | Learns which descriptor slots the title wrote from its patched stores, instead of looking at every changed heap page each frame. | off | 1 = on; unset/anything else = off |
 | `VICTORY_PORT_DESCRIPTORS_CHECK` | Sets how many heap pages the fallback checks per frame when descriptor porting is on. | 16 | &lt;pages per frame, integer>; 0 = none |
 | `VICTORY_PORT_DESCRIPTORS_EVERY` | Sets how many frames pass between the fallback's questions to the write watch when descriptor porting is on. | 8 | &lt;frames, integer, minimum 1> |
-| `VICTORY_PRELUDE_UPLOADS` | Decides title texture uploads at submission, after the check, and copies them on the list's prelude. | off | 1 = on; unset/other = off |
+| `VICTORY_PRELUDE_UPLOADS` | Decides title texture uploads at submission, after the check, and copies them on the list's prelude. *Set by `scripts\play.ps1`.* | off | 1 = on; unset/other = off |
 | `VICTORY_PROBE` | Test tool: runs each .dxil file in the folder on the card and prints what the host's compiler made of it. | not set (test only) | &lt;folder of .dxil files> |
 | `VICTORY_PROCESS_PRIORITY` | Stops the process from raising itself to above-normal priority. | above normal priority | normal or 0 = leave priority as started; anything else = above normal |
 | `VICTORY_PROFILE` | Samples the busiest threads' stacks at an interval during a time window and writes where the process's time goes to a file. *Diagnostics build only.* | off | &lt;from>,&lt;to>,&lt;ms>,&lt;file>: seconds window, sample interval in milliseconds, output file |
 | `VICTORY_QUEUE_BATCH` | The texture pass tells the texture queue what came of its slots 16 at a time and takes slot state with the slots due. | on | 0 = one take of the queue's lock per slot, as before; anything else = on |
-| `VICTORY_QUEUE_HOST_TEXTURES` | Queues records of textures the host writes for the texture pass. | on | 0 = leave them out of the queue; anything else = on |
+| `VICTORY_QUEUE_HOST_TEXTURES` | Queues records of textures the host writes for the texture pass. *Set by `scripts\play.ps1`.* | on | 0 = leave them out of the queue; anything else = on |
 | `VICTORY_QUEUE_MARKS` | The texture queue's marks let notes that change nothing skip its lock. | on | 0 = the earlier take-out skip only (and `VICTORY_TABLED_REREAD` does nothing); anything else = on |
 | `VICTORY_QUEUE_WAIT` | Makes queues honour fence waits; when off every submission runs as soon as it is made. | on | 0 = off; anything else = on |
 | `VICTORY_QUICK_FIND` | Keeps a per-thread cache of the last copy found for an address, avoiding the shared map's lock. | on | 0 = off; anything else = on |
@@ -390,9 +389,9 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_SUBMIT_FRAMES` | Limits how many presents may wait in the line before a present call returns. *Set by `scripts\play.ps1`.* | 1 | &lt;count of presents, integer>; 0 = both the previous and the current frame are sent |
 | `VICTORY_SWEEP` | Once a second, lets go of host copies, staging buffers and texture copies that nothing names any more. | on | 0 = off; anything else = on |
 | `VICTORY_SWEEP_PER_HEAP` | Runs the heap buffer pass once per bound view heap each frame instead of once for all heaps. | off | 1 = on; unset/other = off |
-| `VICTORY_SYNC_FINE` | Hands each thread fewer descriptor pages and records at a time when syncing heaps, so the work spreads across more threads. | off | any value except 0 = on; 0/unset = off |
+| `VICTORY_SYNC_FINE` | Hands each thread fewer descriptor pages and records at a time when syncing heaps, so the work spreads across more threads. *Set by `scripts\play.ps1`.* | off | any value except 0 = on; 0/unset = off |
 | `VICTORY_SYNC_IN_PLACE` | Reads a changed descriptor page's records in place and compares each with the last seen, instead of copying the page first. | on | 0 = off; anything else = on |
-| `VICTORY_TABLED_REREAD` | A later table read in the same frame takes out a slot written after the frame's first read. | off | 1 = on; unset/other = off |
+| `VICTORY_TABLED_REREAD` | A later table read in the same frame takes out a slot written after the frame's first read. *Set by `scripts\play.ps1`.* | off | 1 = on; unset/other = off |
 | `VICTORY_TABLED_TEXTURES` | Keeps textures that draws read through tables in the queue of textures picked by index, as before. | off (tabled slots leave the queue) | 1 = keep them in the queue as before; unset/other = leave the queue |
 | `VICTORY_TAKE_PARTS` | When a write-watched page was taken before, copies only the parts written since where known, not the whole page. | on | 0 = off; anything else = on |
 | `VICTORY_TARGET_VARIANTS` | Gives a draw into views of other formats than its pipeline declares a host pipeline built for those formats. | on | 0 = off; anything else = on |
@@ -402,7 +401,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_TEXTURE_AWAY_MS` | Waits this long before a texture slot whose memory is unmapped goes null, so surfaces do not flash black. | 3000 | &lt;milliseconds, integer>; 0 = at once |
 | `VICTORY_TEXTURE_BACK` | Picks which shader-written texture kinds are copied back to title memory so the title's CPU can read them (the ocean maps). | the four water kinds (256x256f41, 256x256f16, 64x64f16, 128x128f36) | 1 = default kinds; 0 = none; &lt;WxHf&lt;format number>,... list of kinds> |
 | `VICTORY_TEXTURE_BUDGET_MB` | Caps the bytes of host copies of title-filled textures made for index-picked shaders. | none (share of the card's budget; 4 GB without a budget) | &lt;megabytes, integer> = cap on bytes of host texture copies |
-| `VICTORY_TEXTURE_CATCHUP` | Gives a large backlog of textures three times the usual bytes and time per frame until it drains. | on | 0 = off; anything else = on |
+| `VICTORY_TEXTURE_CATCHUP` | Gives a large backlog of textures three times the usual bytes and time per frame until it drains. *Set by `scripts\play.ps1`.* | on | 0 = off; anything else = on |
 | `VICTORY_TEXTURE_COPY` | Reads a fully mapped texture's memory through the kernel's copy instead of in place. | off | 1 = on; unset/other = off |
 | `VICTORY_TEXTURE_FILL` | Lets a refresh that does not wait still fill a never-filled staging buffer from the pages present, instead of leaving zeros. | on | 0 = off; anything else = on |
 | `VICTORY_TEXTURE_GUARD` | Uses a write guard on texture memory and hashes it only every eighth frame, instead of hashing it whole at every check. | on | 0 = off; anything else = on |
@@ -415,7 +414,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_TEXTURE_ROOM_PERCENT` | Sets the share of the card's budget up to which host copies of index-picked textures are made; unset, the line is the budget less max(768 MiB, 5 %), never under 90 %. | not set (about 93 % on a 12 GB card) | &lt;percent, integer>, clamped to 50-97; 90 = the line as before |
 | `VICTORY_TEXTURE_SAME` | Skips an upload when title memory holds the same bytes the host texture copy was already filled from. | on | 0 = off; anything else = on |
 | `VICTORY_TEXTURE_STAGE_MB` | Sets how many megabytes of index-picked textures are made and staged per frame pass. | not set (computed from the card's room) | &lt;megabytes per frame pass, integer> |
-| `VICTORY_TEXTURE_STAGE_MS` | Sets the time limit per frame pass for making and staging index-picked textures. | 250 | &lt;milliseconds per pass, integer> |
+| `VICTORY_TEXTURE_STAGE_MS` | Sets the time limit per frame pass for making and staging index-picked textures. *Set by `scripts\play.ps1`.* | 250 | &lt;milliseconds per pass, integer> |
 | `VICTORY_TEXTURE_STORE` | Keeps the larger levels of streamed textures in an on-disk store for reuse. | off | 1 = textures folder of the cache; &lt;folder path>; empty/0 = off |
 | `VICTORY_TEXTURE_SWEEP` | Lets go of host texture copies that have been idle for several frames, before a submission starts. | on | 0 = off; anything else = on |
 | `VICTORY_TEXTURE_VOLATILE` | Re-uploads a texture the title rewrites between recording and submission in every list that samples it, to stop flicker. | on | 0 = off; anything else = on |
@@ -470,7 +469,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_WAVE_WIDE` | Translates console wave64 programs as two host waves (wide form); unset widens only one narrow case. | unset: only one narrow case is widened | 1 = wide form on; 0 = never wide; unset = narrow case only |
 | `VICTORY_WAVE_WIDE_VOLUMETRIC` | The volumetric light's two tiled programs and four more 64-thread LDS programs refused on RTX cards (VIctory-NVIDIA pull request 101) take the wave-wide form before any approximate one. Changes translations. | off | 1 = on (ignored while `VICTORY_WAVE_WIDE` is set); unset/other = off |
 | `VICTORY_WC_BAR` | Gives a write-combined title buffer one copy in card memory the CPU maps. | off | 1 = on; unset/other = off |
-| `VICTORY_WC_NO_BACK` | Leaves what shaders write in card copies of write-combined title memory on the card (no compare, fetch or merge back). | off | 1 = on; unset/other = off |
+| `VICTORY_WC_NO_BACK` | Leaves what shaders write in card copies of write-combined title memory on the card (no compare, fetch or merge back). *Set by `scripts\play.ps1`.* | off | 1 = on; unset/other = off |
 | `VICTORY_WC_NO_BACK_MIN_KB` | The smallest copy `VICTORY_WC_NO_BACK` and `VICTORY_WC_BAR` apply to (smaller ones went near black in cutscenes). | 1024 | &lt;KiB, integer>; 0 = every copy |
 | `VICTORY_WIDE_BACK` | Takes snapshots of shader-written ranges and compares them across several threads, one range per thread. *Set by `scripts\play.ps1`.* | on | 0 = off; anything else = on |
 | `VICTORY_WIDE_FILLS` | Does a submission's upload memory fills together on several threads. | on (needs WIDE_REFRESH on) | 0 = off; anything else = on |

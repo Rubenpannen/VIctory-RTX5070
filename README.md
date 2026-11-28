@@ -41,6 +41,7 @@ more. The first four rows are the same scene of the prologue each time
 | 2-minute runs at 1920x1080, `scripts\play.ps1` defaults | 112-138 ms (about 7-9 fps), 125 ms with patch 2 in the same runs |
 | 10 minutes at 1920x1080, the night of 2026-11-26 to 27 | 103 ms (about 10 fps), best line 68 ms |
 | 5 minutes at 1920x1080 after the first part of the VIctory-NVIDIA port (66f54796) | 105 ms, best line 64 ms; the card 41 ms, the wait for it 37 ms |
+| One pair of 4-minute runs at 1920x1080 on 2026-11-28, without and with ten of VIctory-NVIDIA's launcher switches (now `scripts\play.ps1` defaults), about 5,700 draws a frame | 100 -> 63 ms (about 10 -> 16 fps); copying back 46 -> 16 ms a frame. That run also had `VICTORY_RIPE_BLOCKS=0`, which is not a default |
 
 The ports of 2026-11-27 were fixes first: they did not move the median. The first
 run of a new build is not one to measure: with the shader cache refilling and the
@@ -156,8 +157,9 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-`-NvidiaDefaults` also sets the switches VIctory-NVIDIA's launcher sets and this
-script does not (listed in the script with what each does; not measured on this PC yet).
+Ten of the switches VIctory-NVIDIA's launcher sets are set as well (not with `-Safe`;
+listed in the script with what each does): in one pair of runs of 2026-11-28 at
+1920x1080 the frame's median went from 100 to 63 ms with them, the picture as before.
 The title renders for 2560x1440 at full scale by default (`VICTORY_OUTPUT=2560x1440`,
 `VICTORY_RENDER_SCALE=1.0`; left alone it renders 2560x1440 and scales it up to
 3840x2160). `-Display` picks the output size: `1920x1080`, `1664x936`, `1280x720`,
