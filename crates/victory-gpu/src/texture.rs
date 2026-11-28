@@ -797,11 +797,14 @@ pub(crate) struct Digest(pub(crate) u128);
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
+    // (Every texture a table shows comes here, on every translating thread:
+    // diagnostics builds count how often another thread held the lock.)
+    #[cfg(feature = "diagnostics")]
+    let written = crate::laps::locked(crate::laps::HOST_WRITTEN, &HOST_WRITTEN);
+    #[cfg(not(feature = "diagnostics"))]
+    let written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let host_written = written.as_ref().is_some_and(|set| set.contains(&(resource as usize)));
+    drop(written);
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written {

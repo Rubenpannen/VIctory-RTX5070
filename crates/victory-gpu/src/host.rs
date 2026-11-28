@@ -3703,8 +3703,16 @@ fn stale_of(
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
-        // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        // before: hundreds of short runs each, at about 1.5 us a run. A
+        // submission that may have more steps done on the card
+        // (`VICTORY_CARD_STEPS_MORE`) reads more of the ring through its
+        // list's refresh: four times the runs, or it would wait here
+        // instead of there.
+        let mut runs_left = match card_steps::stage() {
+            0 => 512,
+            _ if card_steps::more() => 16384,
+            _ => 4096,
+        };
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
@@ -6232,7 +6240,7 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        let own = if late { self.card_steps(runs, parts.len() + 1) } else { None };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -7809,7 +7817,16 @@ impl HostList {
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
-        self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+        // (Taken many times in a draw or dispatch: diagnostics builds count
+        // them in the calls they split, `crate::laps`.)
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::laps::locked(crate::laps::STEPS, &self.deferred)
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+        }
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.

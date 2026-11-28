@@ -1707,6 +1707,7 @@ impl State {
             crate::pipeline::note_left_out();
             return false;
         }
+        crate::lap!(PIPELINE);
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
@@ -1721,6 +1722,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        crate::lap!(BUFFERS);
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1800,7 +1802,8 @@ impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        crate::lap_held!(PASSES, self.early_textures(list, p, compute));
+        crate::lap!(BIND_STATE);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1895,6 +1898,7 @@ impl State {
             }
             let made = self.tables(list, &t.tables, &t.host.half_views, compute);
             STORES.set(true);
+            crate::lap!(USER_DATA);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1916,7 +1920,7 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
+                let Some(ready) = crate::lap_held!(PASSES, self.memory_ready(list, t, compute, use_)) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1924,6 +1928,7 @@ impl State {
             } else {
                 None
             };
+            crate::lap!(USER_DATA);
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
                 let mut room = [0u32; 64];
@@ -1963,6 +1968,7 @@ impl State {
                     }
                 }
             }
+            crate::lap!(ROOT_VIEWS);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1983,7 +1989,9 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
-                        match self.heap_buffers(list) {
+                        let buffers = crate::lap_held!(PASSES, self.heap_buffers(list));
+                        crate::lap!(ROOT_VIEWS);
+                        match buffers {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
@@ -2072,6 +2080,7 @@ impl State {
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
+        crate::lap!(TWINS);
         list.twins_written();
         true
     }
@@ -3171,6 +3180,7 @@ impl State {
             }
             return;
         }
+        crate::lap!(PIPELINE);
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -3197,6 +3207,7 @@ impl State {
             }
             return;
         }
+        crate::lap!(NOTES);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -3204,6 +3215,7 @@ impl State {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
         }
+        crate::lap!(HOST_CALL);
         // Counted in threads: whole groups of them, and the program is told
         // how many of the last one run, where it asks (its `bind` set that to
         // all of them).
@@ -3223,9 +3235,10 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        crate::lap!(AFTER);
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        self.after_dispatch(list, p);
+        crate::lap_held!(AFTER, self.after_dispatch(list, p));
     }
 
     /// What follows a dispatch of `p`, direct or indirect: the stand-in for
@@ -3682,6 +3695,7 @@ impl State {
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
+                    crate::lap!(NOTES);
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -3689,6 +3703,7 @@ impl State {
                     if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     }
+                    crate::lap!(HOST_CALL);
                     // (The host takes 65,535 groups in a dimension: more is
                     // undefined there.)
                     if x > 65_535 {
@@ -3728,7 +3743,8 @@ impl State {
                             }
                         }
                     }
-                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+                    crate::lap!(AFTER);
+                    crate::lap_held!(AFTER, self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This)));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3866,6 +3882,7 @@ impl State {
         half: &[(u8, u32)],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        crate::lap!(TABLES_OWN);
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         // Whether the shader moves halves through descriptor `k` of the table
@@ -3913,6 +3930,7 @@ impl State {
             if !selected_slot(&fresh, slot) {
                 continue;
             }
+            crate::lap!(TABLES_KEYS);
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -3984,9 +4002,12 @@ impl State {
                     if *depth {
                         TESTED_DEPTH.set((reader.3, true));
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::laps::ready();
                     made.push((slot, first * 32));
                     continue;
                 }
+                crate::lap!(TABLES_AGAIN);
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -4023,6 +4044,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            crate::lap!(TABLES_MADE);
             let Some(first) = self.reserve_dynamic(heap, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
@@ -4247,14 +4269,17 @@ impl State {
             } else {
                 (vertices, first)
             };
+            crate::lap!(NOTES);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            crate::lap!(HOST_CALL);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            crate::lap!(AFTER);
+            crate::lap_held!(AFTER, self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This)));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4352,14 +4377,17 @@ impl State {
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
+            crate::lap!(NOTES);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            crate::lap!(HOST_CALL);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            crate::lap!(AFTER);
+            crate::lap_held!(AFTER, self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This)));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4433,6 +4461,7 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
+        crate::lap!(BATCH_OPEN);
         let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -4473,6 +4502,14 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // Its time is split by what it executes (`crate::laps`).
+        #[cfg(feature = "diagnostics")]
+        crate::laps::kind(match kind {
+            DISPATCH => crate::laps::INDIRECT_DISPATCH,
+            MESH => crate::laps::INDIRECT_MESH,
+            _ => crate::laps::INDIRECT_DRAW,
+        });
+        crate::lap!(PIPELINE);
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -4508,6 +4545,7 @@ impl State {
             ));
             return false;
         }
+        crate::lap!(ARGUMENTS);
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
@@ -4523,6 +4561,7 @@ impl State {
             },
             None => None,
         };
+        crate::lap!(SIGNATURE);
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -4530,6 +4569,7 @@ impl State {
             why("no host signature");
             return false;
         };
+        crate::lap!(REST);
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
@@ -4588,6 +4628,7 @@ impl State {
             None
         };
         let mut second = None;
+        crate::lap!(BATCH_PLACE);
         // Other single records can still be clamped in a batch.
         let batch = if group_base.is_none() && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
@@ -4598,6 +4639,7 @@ impl State {
         if batch.is_some() {
             self.window = None;
         }
+        crate::lap!(CLAMP);
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -4713,12 +4755,14 @@ impl State {
             self.host_pipeline = plain.as_raw() as usize;
             list.keep(plain);
         }
+        crate::lap!(NOTES);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+        crate::lap!(HOST_CALL);
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -4756,10 +4800,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        crate::lap!(AFTER);
         if kind == DISPATCH {
             self.buffers_written();
         } else {
-            self.drew(list, Some(p));
+            crate::lap_held!(AFTER, self.drew(list, Some(p)));
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
@@ -4767,7 +4812,7 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             // (The reflections' resolve is dispatched so.)
-            self.after_dispatch(list, p);
+            crate::lap_held!(AFTER, self.after_dispatch(list, p));
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4820,6 +4865,11 @@ mod thread_tests {
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
+    // (Every indirect execution of every translating thread comes here:
+    // diagnostics builds count how often another thread held it.)
+    #[cfg(feature = "diagnostics")]
+    let mut made = crate::laps::locked(crate::laps::SIGNATURES, &MADE);
+    #[cfg(not(feature = "diagnostics"))]
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
         return Some(s.clone());

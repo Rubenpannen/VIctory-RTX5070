@@ -57,6 +57,8 @@ mod launch;
 pub mod port_descriptors;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod laps;
 pub mod list;
 pub mod object;
 pub mod pipeline;

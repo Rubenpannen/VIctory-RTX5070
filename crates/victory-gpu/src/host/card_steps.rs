@@ -46,7 +46,7 @@ use crate::shadow::Shadow;
 /// `stale_under_flights`, which settles if it cannot). Nothing of this
 /// submission writes these bytes earlier than our list: the steps are done
 /// in front of all its lists in either case, and among themselves in the
-/// order they stand in wherever one depends on another: [`plan`] takes
+/// order they stand in wherever one depends on another: [`plan_within`] takes
 /// every copy and fill of the submission that writes what a taken one
 /// reads or writes, or reads what a taken one writes. Every draw that
 /// reads a buffer view of the heap relies on the same refresh and the same
@@ -63,7 +63,7 @@ use crate::shadow::Shadow;
 /// here. Refused: a step of the submission that cannot be taken (a texture,
 /// vertices expanded, a fill of memory of another kind) reads the
 /// destination behind the copy, or a refresh brings another host copy of it
-/// up to date ([`plan`], [`elsewhere`]). While such a copy is in the air a
+/// up to date ([`plan_within`], [`elsewhere`]). While such a copy is in the air a
 /// submission that refreshes another host copy of its destination, or
 /// reads it in a step that is not checked otherwise, waits for it
 /// ([`copied_read`]); with the copy done on the CPU it was there at once.
@@ -103,8 +103,37 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
-/// Why [`plan`] refuses for [`place`].
+/// Whether a submission may have more done on the card
+/// (`VICTORY_CARD_STEPS_MORE=1`; off by default): up to [`MOST_MORE`] steps
+/// and [`BETWEEN_MORE`] bytes instead of [`MOST`] and [`BETWEEN`], and four
+/// times the changed runs sent up under flights' writes (`stale_of`: the
+/// refresh of our list goes through that budget, and past it the submission
+/// waits all the same).
+///
+/// In heavier scenes one submission a frame was refused with "too many steps
+/// depend on it" and stood 37 ms (the median of those lines) until the
+/// flights had landed: from about five minutes into the run of 2026-11-28 on
+/// the RTX 5070 at 1080p, with up to eight parts of submissions prepared as
+/// one (`VICTORY_JOIN_PARTS=8`). How far over such a submission is was not
+/// known when the numbers were chosen; diagnostics builds say with the frame
+/// line (`sized`). A step costs the submitting thread about 0.7 us, so
+/// this pays only where the wait is longer than that.
+pub(super) fn more() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_STEPS_MORE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_MORE"))
+}
+
+/// Why [`plan_within`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
+
+/// Why a submission is refused for its size: more steps than the first of
+/// [`limits`], more bytes than the second.
+const TOO_MANY: &str = "too many steps depend on it";
+const TOO_MUCH: &str = "too much at once";
 
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
@@ -112,6 +141,20 @@ const BETWEEN: u64 = 4 << 20;
 
 /// The most steps of a submission done this way.
 const MOST: usize = 12288;
+
+/// The same with [`more`], and how many buffers of that size are ever made
+/// (128 MiB of the card's memory): with none free the submission waits, as
+/// one over the limits does.
+const BETWEEN_MORE: u64 = 16 << 20;
+const MOST_MORE: usize = 49152;
+const OWN_MORE: usize = 8;
+const _: () = assert!(MOST < MOST_MORE && BETWEEN < BETWEEN_MORE);
+
+/// The most steps and bytes of a submission done on the card now. (Asked
+/// once for a submission: `VICTORY_AB` changes it on another thread.)
+fn limits() -> (usize, u64) {
+    if more() { (MOST_MORE, BETWEEN_MORE) } else { (MOST, BETWEEN) }
+}
 
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
@@ -258,7 +301,15 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// Steps of a level are done together, every read before every write; a
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
-fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+///
+/// `most`: more steps than that are refused ([`TOO_MANY`]).
+fn plan_within(
+    does: &[Does],
+    stage: u32,
+    by_order: bool,
+    most: usize,
+    behind: &mut Option<(usize, usize)>,
+) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
@@ -298,8 +349,8 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         if writes.iter().any(|w| w.0 < w.1) {
             join_ranges(&mut written, writes);
         }
-        if taken.iter().filter(|t| **t).count() > MOST {
-            return Err("too many steps depend on it");
+        if taken.iter().filter(|t| **t).count() > most {
+            return Err(TOO_MANY);
         }
         for (i, d) in does.iter().enumerate() {
             // A fill that cannot be taken is looked at below.
@@ -537,7 +588,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let (does, steps) = does_of(&written, runs);
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     // A copy at its place that waits only because a step of a later list
-    // reads what it writes on the CPU: [`plan`] refuses it before it gets
+    // reads what it writes on the CPU: [`plan_within`] refuses it before it gets
     // to [`BEHIND_PLACED`] ("a copy at its place waits for flights"), so it
     // is looked for here. On the RTX 5070 the title copies 240, 3,424 and
     // 32,304 bytes out of its heap, which a dispatch in the air writes, to
@@ -548,7 +599,9 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
         return (place(reader)? >= cut).then_some(cut);
     }
     let mut behind = None;
-    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+    // (Within the same number of steps as the submission's own plan: one
+    // over it is refused there before it gets to this reason.)
+    if plan_within(&does, stage(), true, limits().0, &mut behind) != Err(BEHIND_PLACED) {
         return None;
     }
     let (placed, reader) = behind?;
@@ -689,10 +742,12 @@ fn record(
     }
 }
 
-/// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
+/// The list in front of a submission's, and its buffer of `size` bytes
+/// ([`BETWEEN`], or [`BETWEEN_MORE`] for a submission that needs more).
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    size: u64,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -702,6 +757,11 @@ unsafe impl Send for Own {}
 
 /// Those that have landed: closed, their steps dropped.
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
+
+/// The same of those with a buffer of [`BETWEEN_MORE`] bytes, and how many
+/// of them were made ([`OWN_MORE`] at most).
+static POOL_MORE: Mutex<Vec<Own>> = Mutex::new(Vec::new());
+static MADE_MORE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Since the last frame-rate line: fills and copies done on the card, their
 /// bytes, and submissions that waited instead, refused by a check.
@@ -740,7 +800,9 @@ impl Taken {
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
-        POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self.own);
+        // (By its buffer's size, whatever the switch is now.)
+        let pool = if self.own.size > BETWEEN { &POOL_MORE } else { &POOL };
+        pool.lock().unwrap_or_else(|e| e.into_inner()).push(self.own);
     }
 }
 
@@ -749,7 +811,10 @@ impl Host {
     /// now is reads of title memory that can all be done on the card
     /// ([`stage`]), the list that does them. `None` if nothing is in the
     /// way or the old wait is due. Under the submission lock.
-    pub(super) fn card_steps(&self, runs: &[&HostList]) -> Option<Taken> {
+    ///
+    /// `parts`: how many parts of submissions `runs` are ([`joins`]), for
+    /// the diagnostics' line of those refused for their size.
+    pub(super) fn card_steps(&self, runs: &[&HostList], parts: usize) -> Option<Taken> {
         if stage() == 0 || !relay_exact() {
             return None;
         }
@@ -767,7 +832,7 @@ impl Host {
         let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
-            self.take_steps(&written, runs)
+            self.take_steps(&written, runs, parts)
         };
         match taken {
             Ok(taken) => taken,
@@ -781,10 +846,17 @@ impl Host {
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList], parts: usize) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let (most, between) = limits();
+        let planned = plan_within(&does, stage(), placed_order(), most, &mut None);
+        #[cfg(feature = "diagnostics")]
+        if planned == Err(TOO_MANY) {
+            sized(0, &does, None, runs.len(), parts);
+        }
+        let _ = parts;
+        let chosen = planned?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -829,8 +901,10 @@ impl Host {
             let at = match places.get(&place) {
                 Some(&at) => at,
                 None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
+                    if end + len as u64 > between {
+                        #[cfg(feature = "diagnostics")]
+                        sized(1, &does, Some(&chosen), runs.len(), parts);
+                        return Err(TOO_MUCH);
                     }
                     if !mapped(src, src + len, &mut room) {
                         return Err("not all of what it reads is mapped");
@@ -876,8 +950,12 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
-        let Some(own) = self.own_list() else {
-            return Err("no host list or buffer for it");
+        let Some(own) = self.own_list(end) else {
+            return Err(if end > BETWEEN {
+                "its larger buffers are all in the air"
+            } else {
+                "no host list or buffer for it"
+            });
         };
         // First every refresh, then the writes: the bytes compared with are
         // the title's. (One step for each host copy, over all that is read of
@@ -957,17 +1035,79 @@ impl Host {
         }))
     }
 
-    /// A list of ours open for recording, and its buffer.
-    fn own_list(&self) -> Option<Own> {
-        let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    /// A list of ours open for recording, and its buffer, which holds
+    /// `bytes`: of [`BETWEEN`] bytes, or of [`BETWEEN_MORE`] where that is
+    /// not enough. `None` too when all the larger ones are in the air.
+    fn own_list(&self, bytes: u64) -> Option<Own> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let more = bytes > BETWEEN;
+        let pool = if more { &POOL_MORE } else { &POOL };
+        let pooled = pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
         if let Some(own) = pooled {
             own.list.reset();
             return Some(own);
         }
-        let between = self.uav_buffer(BETWEEN)?;
-        name(&between, || "copies of title memory on the card".into());
-        let list = self.new_list().ok()?;
-        Some(Own { list, between })
+        let size = if more { BETWEEN_MORE } else { BETWEEN };
+        if more && MADE_MORE.fetch_add(1, Relaxed) >= OWN_MORE {
+            MADE_MORE.fetch_sub(1, Relaxed);
+            return None;
+        }
+        let made = self.uav_buffer(size).and_then(|between| {
+            name(&between, || "copies of title memory on the card".into());
+            let list = self.new_list().ok()?;
+            Some(Own { list, between, size })
+        });
+        if more && made.is_none() {
+            MADE_MORE.fetch_sub(1, Relaxed);
+        }
+        made
+    }
+}
+
+/// Diagnostics: submissions refused for their size since the last frame-rate
+/// line (for [`TOO_MANY`], for [`TOO_MUCH`]), and the largest of them.
+#[cfg(feature = "diagnostics")]
+static SIZES: Mutex<([u64; 2], Option<Size>)> = Mutex::new(([0; 2], None));
+
+/// A submission refused for its size.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+struct Size {
+    /// Copies and fills that flights in the air keep off the CPU.
+    asked: usize,
+    /// With every step that depends on one of them, their distinct places
+    /// and those places' bytes, each rounded up to 256 (a place read on two
+    /// levels takes its bytes twice: at least this many); or why not even a
+    /// plan without a limit takes them.
+    taken: Result<(usize, usize, u64), &'static str>,
+    /// The submission's steps, lists and parts.
+    steps: usize,
+    lists: usize,
+    parts: usize,
+}
+
+/// Diagnostics: a submission of `does` was refused for the size `which`
+/// ([`SIZES`]). `chosen`: its plan, if that was not what refused it.
+#[cfg(feature = "diagnostics")]
+fn sized(which: usize, does: &[Does], chosen: Option<&[(usize, u32)]>, lists: usize, parts: usize) {
+    let asked = does.iter().filter(|d| matches!(d, Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. })).count();
+    // (Made once more without a limit: only for a submission that waits.)
+    let all = match chosen {
+        Some(chosen) => Ok(chosen.to_vec()),
+        None => plan_within(does, stage(), placed_order(), usize::MAX, &mut None),
+    };
+    let taken = all.map(|chosen| {
+        let places: std::collections::HashSet<(usize, usize)> =
+            chosen.iter().filter_map(|&(i, _)| reads_writes(&does[i]).map(|(r, _)| (r.0, r.1 - r.0))).collect();
+        let bytes: u64 = places.iter().map(|&(_, len)| (len as u64).next_multiple_of(256)).sum();
+        (chosen.len(), places.len(), bytes)
+    });
+    let size = Size { asked, taken, steps: does.len(), lists, parts };
+    let of = |s: &Size| s.taken.map_or(s.asked, |t| t.0);
+    let mut sizes = SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    sizes.0[which] += 1;
+    if sizes.1.is_none_or(|largest| of(&size) > of(&largest)) {
+        sizes.1 = Some(size);
     }
 }
 
@@ -1010,6 +1150,29 @@ pub(super) fn log(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     {
+        let (refused, largest) = std::mem::take(&mut *SIZES.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(size) = largest {
+            let (most, between) = limits();
+            let with = match size.taken {
+                Ok((taken, places, bytes)) => {
+                    format!("{taken} with those that depend on them, at least {} KB in {places} places", bytes / 1024)
+                }
+                Err(why) => format!("with those that depend on them refused whatever the limit: {why}"),
+            };
+            tracing::info!(
+                "submissions refused for their size, per frame: {:.2} for more than {most} steps, {:.2} for more than {} MiB \
+                 (VICTORY_CARD_STEPS_MORE=1: up to {MOST_MORE} steps and {} MiB); the largest since the last line: {} steps \
+                 asked for, {with}, of {} steps in {} lists of {} parts",
+                refused[0] as f64 / frames,
+                refused[1] as f64 / frames,
+                between >> 20,
+                BETWEEN_MORE >> 20,
+                size.asked,
+                size.steps,
+                size.lists,
+                size.parts,
+            );
+        }
         let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         if r.iter().any(|&n| n > 0.0) {
             tracing::info!(
@@ -1059,9 +1222,28 @@ mod tests {
         Does::Fill { src, len, asked: false, to: false }
     }
 
+    /// The plan within the usual number of steps.
+    fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+        plan_within(does, stage, by_order, MOST, behind)
+    }
+
     /// What is done on the card, as (place, level), in stage 2.
     fn planned(does: &[Does]) -> Vec<(usize, u32)> {
         plan(does, 2, true, &mut None).unwrap()
+    }
+
+    /// More steps than the limit are refused for their number, those asked
+    /// for and those that only depend on them alike; within it all are taken.
+    #[test]
+    fn more_steps_than_the_limit_are_refused() {
+        let fills: Vec<Does> = (0..40).map(|i| fill(1000 + 64 * i, 64, true)).collect();
+        assert_eq!(plan_within(&fills, 2, true, 39, &mut None), Err(TOO_MANY));
+        assert_eq!(plan_within(&fills, 2, true, 40, &mut None).map(|chosen| chosen.len()), Ok(40));
+        // One copy asked for, and three fills that read what it writes.
+        let mut does = vec![copy(1000, 5000, 100, true)];
+        does.extend((0..3).map(|i| fill(1000 + 16 * i, 16, false)));
+        assert_eq!(plan_within(&does, 2, true, 3, &mut None), Err(TOO_MANY));
+        assert_eq!(plan_within(&does, 2, true, 4, &mut None).map(|chosen| chosen.len()), Ok(4));
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
@@ -1296,7 +1478,8 @@ mod tests {
             (*x, *y) = (i as u8 ^ (i >> 8) as u8, 0xee);
         }
         let was = a_bytes.to_vec();
-        let own = host.own_list().unwrap();
+        let own = host.own_list(0).unwrap();
+        assert_eq!(own.size, BETWEEN);
         // Within `a` (there and back), from `a` to `b`, and a read alone.
         record(
             true,
@@ -1333,8 +1516,18 @@ mod tests {
         assert_eq!(a_bytes, &was[..]);
         // As the landing does: its next use records anew.
         POOL.lock().unwrap().push(own);
-        let own = host.own_list().unwrap();
+        let own = host.own_list(0).unwrap();
         own.list.close();
+        // A submission that needs more takes a larger buffer, of a pool of
+        // its own.
+        let large = host.own_list(BETWEEN + 1).unwrap();
+        // SAFETY: a live buffer.
+        assert_eq!((large.size, unsafe { large.between.GetDesc() }.Width), (BETWEEN_MORE, BETWEEN_MORE));
+        large.list.close();
+        POOL_MORE.lock().unwrap().push(large);
+        let large = host.own_list(BETWEEN_MORE).unwrap();
+        assert_eq!(large.size, BETWEEN_MORE);
+        large.list.close();
     }
 
     /// The whole way, in a process of its own with the relay on:

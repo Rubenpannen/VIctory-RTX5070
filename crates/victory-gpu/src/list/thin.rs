@@ -244,6 +244,8 @@ impl Recording {
             };
             let began = std::time::Instant::now();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            #[cfg(feature = "diagnostics")]
+            crate::laps::flush();
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
@@ -359,6 +361,8 @@ pub(crate) fn line(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     op_line(frames);
+    #[cfg(feature = "diagnostics")]
+    crate::laps::line(frames);
 }
 
 #[inline]
@@ -529,6 +533,23 @@ fn op_line(frames: f64) {
         .map(|(name, n, ms)| format!("{name} {n:.0}x {ms:.1} ms ({:.1} us)", ms * 1000.0 / n.max(1e-9)))
         .collect();
     tracing::info!("list calls translated per frame by kind, the costliest (VICTORY_THIN): {}", text.join(", "));
+}
+
+/// Diagnostics: the kind of call `op` is for `crate::laps`, if its time is
+/// split into parts.
+#[cfg(feature = "diagnostics")]
+fn lap_kind(op: u64) -> Option<u8> {
+    use crate::laps;
+    const OPS: [(Plain, u8); 7] = [
+        (Plain::DRAW, laps::DRAW),
+        (Plain::DRAW_INDEXED, laps::DRAW_INDEXED),
+        (Plain::DISPATCH, laps::DISPATCH),
+        (Plain::DISPATCH_X, laps::DISPATCH),
+        (Plain::DISPATCH_MESH, laps::DISPATCH_MESH),
+        (Plain::DISPATCH_MESH_X, laps::DISPATCH_MESH),
+        (Plain::EXECUTE_INDIRECT, laps::INDIRECT),
+    ];
+    OPS.into_iter().find_map(|(plain, kind)| (plain as u64 == op).then_some(kind))
 }
 
 /// Diagnostics: adds the time from its making to its drop to its op's.
@@ -786,6 +807,9 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         #[cfg(feature = "diagnostics")]
         let _timed = OpTimer(op, std::time::Instant::now());
+        // The costliest kinds, by part (`crate::laps`).
+        #[cfg(feature = "diagnostics")]
+        let _parts = lap_kind(op).map(crate::laps::begin);
         if run_plain(op, list, w) {
             continue;
         }
