@@ -256,6 +256,8 @@ pub fn fingerprint() -> String {
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
     }
+    // (`VICTORY_SAMPLER_ORDER=1`: nothing without it.)
+    h.update(&super::samplers::order());
     h.finalize().to_hex()[..16].to_owned()
 }
 

@@ -341,6 +341,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_RT_LEAVE_OUT` | Leaves the ray-tracing passes out while the structure builder is off. | on (only while VICTORY_BVH_BUILDER is not 1) | 0 = make the ray-tracing passes; anything else = leave out |
 | `VICTORY_SAFE_COPY` | Copies title memory in our own code rather than through the kernel, guarding against the title unmapping it meanwhile. | on | 0 = off; anything else = on |
 | `VICTORY_SAME_RECORDS` | Skips writing bytes into title memory that already hold the same value, when putting a descriptor copy there. | on | 0 = off; anything else = on |
+| `VICTORY_SAMPLER_ORDER` | Makes every static sampler in one order in every process, from a list kept in the cache's pipelines folder, so the driver's pipeline cache finds pipelines again across runs and `victory warm`. The first run with it compiles the driver's cache anew. | off | 1 = on; unset/other = off |
 | `VICTORY_SAVE_CHILD` | Test-only: save folder passed to the save-game crash test's child process. | not set (test only) | &lt;save folder path>, set by the crash test |
 | `VICTORY_SAVE_OP` | Test-only: which save operation the crash test's child process runs. | not set (test only) | &lt;operation name>, set by the crash test |
 | `VICTORY_SAVE_STOP` | Test-only: makes the save-game crash test's child process stop for good at the named step. | not set (test only) | &lt;step number, integer> |
@@ -395,9 +396,11 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_TABLED_TEXTURES` | Keeps textures that draws read through tables in the queue of textures picked by index, as before. | off (tabled slots leave the queue) | 1 = keep them in the queue as before; unset/other = leave the queue |
 | `VICTORY_TAKE_PARTS` | When a write-watched page was taken before, copies only the parts written since where known, not the whole page. | on | 0 = off; anything else = on |
 | `VICTORY_TARGET_VARIANTS` | Gives a draw into views of other formats than its pipeline declares a host pipeline built for those formats. | on | 0 = off; anything else = on |
+| `VICTORY_TEARING` | Lets the swap chain show a frame as soon as it is presented, not at the screen's next refresh; a refused present goes back to the next refresh for the rest of the run. | off | 1 = on; unset/other = off |
 | `VICTORY_TEST_ROUNDS` | Sets how many rounds a landing stress unit test runs. | 120 (tests only) | &lt;number of rounds, integer> |
 | `VICTORY_TEST_TITLES` | Lists folders or files of real title data for tests that need them; those tests skip when it is unset. | none (tests needing game files skip) | &lt;paths separated by the OS path separator (; on Windows)> |
 | `VICTORY_TEXBACK_ASYNC` | Writes texture read-backs into title memory on a thread of their own. | on | 0 = written on the landing thread, as before; anything else = on |
+| `VICTORY_TEXSPK_PASS_MS` | Caps the time all of a frame's runs of the pass over index-picked textures take together (runs before a bake keep their own budget). | not set (each run within `VICTORY_TEXTURE_STAGE_MS` alone) | &lt;milliseconds, 1 to 1000>; 0 or unset = no cap |
 | `VICTORY_TEXTURE_AWAY_MS` | Waits this long before a texture slot whose memory is unmapped goes null, so surfaces do not flash black. | 3000 | &lt;milliseconds, integer>; 0 = at once |
 | `VICTORY_TEXTURE_BACK` | Picks which shader-written texture kinds are copied back to title memory so the title's CPU can read them (the ocean maps). | the four water kinds (256x256f41, 256x256f16, 64x64f16, 128x128f36) | 1 = default kinds; 0 = none; &lt;WxHf&lt;format number>,... list of kinds> |
 | `VICTORY_TEXTURE_BUDGET_MB` | Caps the bytes of host copies of title-filled textures made for index-picked shaders. | none (share of the card's budget; 4 GB without a budget) | &lt;megabytes, integer> = cap on bytes of host texture copies |

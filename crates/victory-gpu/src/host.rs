@@ -1140,6 +1140,10 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        // Before anything else has a static sampler (`pipeline::samplers`,
+        // `VICTORY_SAMPLER_ORDER=1`): the first thing made with the device, in
+        // the run as in the tools, and before Streamline has the device.
+        crate::pipeline::samplers::prime(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -6755,7 +6759,7 @@ impl Host {
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
+            if let Some([front, behind]) = self.span_lists(*submitted) {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
@@ -10187,6 +10191,41 @@ struct Presenter {
     panel: panel::Panel,
     /// The F1 settings menu.
     menu: menu::Menu,
+    /// The swap chain lets a frame be shown at once ([`tearing`]): its flags, kept for
+    /// ResizeBuffers, which may not change them.
+    tearing: bool,
+    /// Presents ask for that; off for the rest of the run once one such present is refused.
+    presents_tearing: bool,
+}
+
+/// Whether the swap chain lets a frame be shown as soon as it is presented, not at the screen's
+/// next refresh (`DXGI_FEATURE_PRESENT_ALLOW_TEARING`; `VICTORY_TEARING=1`, off by default here:
+/// at the next refresh, as before). Without it a window in front, which Windows then shows
+/// without its compositor ("independent flip"), had each frame wait for a refresh with two
+/// buffers: frame times rounded up to whole refreshes, about 2 fps fewer than the same window
+/// behind another (VIctory-NVIDIA's run of 2026-11-28). On a G-SYNC or FreeSync screen nothing
+/// tears; on others a frame may. (From VIctory-NVIDIA 8fc2254, trustno1-coder, where it is on
+/// unless `=0`.)
+fn tearing(factory: &IDXGIFactory2) -> bool {
+    if !std::env::var("VICTORY_TEARING").is_ok_and(|v| v.trim() == "1") {
+        return false;
+    }
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else { return false };
+    let mut allowed = windows::core::BOOL(0);
+    // SAFETY: a BOOL-sized answer for this feature.
+    let asked = unsafe {
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allowed).cast(),
+            size_of_val(&allowed) as u32,
+        )
+    };
+    asked.is_ok() && allowed.as_bool()
+}
+
+/// The swap chain's flags for [`tearing`].
+fn chain_flags(tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
+    if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { DXGI_SWAP_CHAIN_FLAG(0) }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -10230,6 +10269,32 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// Logs how even the frames since the last line were: the median, the 95th
+/// and 99th percentile and the longest interval between presents, and how
+/// many took over 50 and over 100 ms (a frame rate of 30 with every frame
+/// at 33 ms plays smoothly; one with frames of 20 and 80 ms stutters).
+/// (From VIctory-NVIDIA 9fed897, shawn.)
+fn frame_times_line(intervals: &mut Vec<f32>) {
+    if intervals.is_empty() {
+        return;
+    }
+    intervals.sort_unstable_by(f32::total_cmp);
+    let at = |q: f32| intervals[((intervals.len() - 1) as f32 * q).round() as usize];
+    let over = |ms: f32| intervals.iter().filter(|&&t| t > ms).count();
+    tracing::info!(
+        target: "victory_gpu::frame_times",
+        "frame times: {} frames, median {:.1} ms, p95 {:.1}, p99 {:.1}, longest {:.1}; {} over 50 ms, {} over 100 ms",
+        intervals.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        intervals[intervals.len() - 1],
+        over(50.0),
+        over(100.0)
+    );
+    intervals.clear();
+}
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
@@ -10238,6 +10303,10 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// The last present counted, and the intervals between presents since
+    /// the last frame-rate line, in ms: what the average hides (stutter).
+    last: std::time::Instant,
+    intervals: Vec<f32>,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -10253,6 +10322,8 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            last: now,
+            intervals: Vec::with_capacity(512),
             caption: None,
         }
     }
@@ -10287,10 +10358,14 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        let now = std::time::Instant::now();
+        self.intervals.push((now - self.last).as_secs_f32() * 1000.0);
+        self.last = now;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        frame_times_line(&mut self.intervals);
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
@@ -10826,7 +10901,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, chain_flags(p.tearing))
             };
             match resized {
                 Ok(()) => {
@@ -11052,7 +11127,15 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let asked = if p.presents_tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
+            let mut status = p.swap_chain.Present(0, asked);
+            if status.is_err() && p.presents_tearing {
+                // A white window on an RTX 5070 at 1440p (VIctory-NVIDIA, 2026-11-28): presents
+                // that may tear were not shown. The rest of the run presents at the next refresh.
+                tracing::warn!(code = ?status, "a present shown at once was refused; presenting at the next refresh for the rest of the run");
+                p.presents_tearing = false;
+                status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
@@ -11092,6 +11175,8 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let tearing = tearing(&factory);
+            tracing::info!(tearing, "swap chain: frames shown as soon as presented (VICTORY_TEARING=1; otherwise at the next refresh)");
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -11103,6 +11188,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: chain_flags(tearing).0 as u32,
                 ..Default::default()
             };
             // With frame generation, through Streamline's factory proxy and
@@ -11154,6 +11240,8 @@ impl Host {
                 composer: None,
                 panel: panel::Panel::new(),
                 menu: menu::Menu::new(),
+                tearing,
+                presents_tearing: tearing,
             })
         }
     }
