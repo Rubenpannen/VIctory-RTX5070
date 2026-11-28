@@ -56,6 +56,81 @@ pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 /// their place behind a copy at its place ([`HostList::placed_constants`]).
 pub(super) static STATS_CONSTANTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether the card buffers of copies at their place
+/// ([`HostList::between`]) are used again by later lists (on by default;
+/// `VICTORY_BETWEEN_POOL=0`: a new buffer for each, let go when its list is
+/// reset, as before). The title's constant buffers behind such copies
+/// ([`HostList::placed_constants`]) took one of 64 KiB each: 6.8 a frame in
+/// the run of 2026-11-27 on the RTX 5070, all 24,300 card buffers made in
+/// its five minutes of play, each about a millisecond of the translating
+/// thread's time (the driver's creation, then the waits of
+/// `VICTORY_WAIT_RESIDENT`).
+fn between_pool() -> bool {
+    crate::toggled!("VICTORY_BETWEEN_POOL")
+}
+
+/// The bytes of buffers [`BETWEEN_POOL`] keeps, and how many of the oldest
+/// a taking looks at.
+const BETWEEN_POOL_MOST: u64 = 64 << 20;
+const BETWEEN_POOL_LOOKS: usize = 32;
+
+/// Buffers of [`HostList::between`] whose list was reset, the oldest first,
+/// each with its size; and the bytes of them all. One that a descriptor
+/// slot still shows (`VICTORY_SLOT_HOLDS`) waits here until the slot shows
+/// something else: only a buffer nothing but the pool holds is taken.
+#[allow(clippy::type_complexity)]
+static BETWEEN_POOL: Mutex<(u64, std::collections::VecDeque<(ID3D12Resource, u64)>)> =
+    Mutex::new((0, std::collections::VecDeque::new()));
+
+/// Since the start: buffers taken from [`BETWEEN_POOL`], and made for it.
+static BETWEEN_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A buffer of `size` bytes that no list and no slot holds any more.
+fn between_take(size: u64) -> Option<ID3D12Resource> {
+    let mut pool = BETWEEN_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let at = pool.1.iter().take(BETWEEN_POOL_LOOKS).position(|(b, s)| *s == size && references(b) == 1)?;
+    let (buffer, _) = pool.1.remove(at)?;
+    pool.0 -= size;
+    Some(buffer)
+}
+
+/// A list was reset: its buffers of [`HostList::between`] are kept for the
+/// next lists, while there is room. Its last submission has run by then
+/// (`Deferred`'s drop), and a buffer is in the common state again once the
+/// submission that used it has run, as a new one is.
+pub(super) fn between_give(buffers: impl Iterator<Item = (ID3D12Resource, u64)>) {
+    let mut freed = Vec::new();
+    {
+        let mut pool = BETWEEN_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, size) in buffers {
+            if !between_pool() || pool.0 + size > BETWEEN_POOL_MOST {
+                freed.push(buffer);
+                continue;
+            }
+            pool.0 += size;
+            pool.1.push_back((buffer, size));
+        }
+    }
+    // Let go outside the lock.
+    drop(freed);
+}
+
+/// With the frame line: what [`between_pool`] did since the start. Nothing
+/// while it has done nothing.
+pub(super) fn between_line() {
+    let [taken, made] = [0, 1].map(|i| BETWEEN_POOL_STATS[i].load(Ordering::Relaxed));
+    if taken + made == 0 {
+        return;
+    }
+    let (kept, mb) = {
+        let pool = BETWEEN_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.1.len(), pool.0 >> 20)
+    };
+    tracing::info!(
+        "card buffers of copies at their place used again (VICTORY_BETWEEN_POOL=0: a new one each time): {taken} taken from the pool, {made} made for it, {kept} in it now ({mb} MB)"
+    );
+}
+
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
     pub(super) dst: usize,
@@ -448,9 +523,28 @@ impl HostList {
 
     /// A buffer on the card for this recording alone.
     fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
-        name(&buffer, || "bytes between copies".into());
-        self.keep(&buffer);
+        let size = len.next_multiple_of(1 << 16);
+        if !between_pool() {
+            let buffer = host.uav_buffer(size)?;
+            name(&buffer, || "bytes between copies".into());
+            self.keep(&buffer);
+            return Some(buffer);
+        }
+        // One of a list reset earlier, or a new one, made with no lock held.
+        let buffer = match between_take(size) {
+            Some(taken) => {
+                BETWEEN_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                taken
+            }
+            None => {
+                let made = host.uav_buffer(size)?;
+                name(&made, || "bytes between copies".into());
+                BETWEEN_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+                made
+            }
+        };
+        // Held until the list is reset, then given to the pool.
+        self.deferred().between.push((buffer.clone(), size));
         Some(buffer)
     }
 }

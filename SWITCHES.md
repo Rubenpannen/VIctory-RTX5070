@@ -42,6 +42,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_BENCH_S` | Benchmark test only: how many seconds each measurement runs. | 5, or 30 in the block test (test only) | &lt;seconds, integer> |
 | `VICTORY_BENCH_THREADS` | Benchmark test only: how many threads make texture blocks while long dispatches read them. | 4 (test only) | &lt;threads, integer> |
 | `VICTORY_BENCH_WARP` | Benchmark test only: runs the card measurements on the software (WARP) adapter. | off (test only) | any value = use the software adapter; unset = off |
+| `VICTORY_BETWEEN_POOL` | Uses the card buffers of copies done at their place in a list (and of constant buffers filled behind them) again in later lists, instead of making a new one each time. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_BIND_CACHE` | Skips setting render targets and depth on the host list again when they are the same as already set. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_BLOCK_WAY` | Benchmark test only: which way of making new texture blocks to run (one per process). | not set (test only) | one of: made; waited; enqueued; fresh-made; fresh-waited; fresh-enqueued; never |
 | `VICTORY_BOOK` | Keeps a log of descriptor and memory ownership to name the cause of a device loss. *Diagnostics build only.* | on, but only active when device-removed data or checks are on | 0 = off; anything else (or unset) = on |

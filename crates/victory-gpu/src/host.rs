@@ -2662,6 +2662,10 @@ impl Deferred {
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
+    /// Card buffers of copies at their place (`place::HostList::between`),
+    /// with their sizes: given to their pool when the list is reset
+    /// (`VICTORY_BETWEEN_POOL`).
+    between: Vec<(ID3D12Resource, u64)>,
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
@@ -2701,6 +2705,12 @@ impl Drop for Deferred {
 /// [`HostList::upload`]) are used again: taken from [`UPLOAD_POOL`] and given
 /// back to it when the list is reset (`VICTORY_UPLOAD_POOL=1`, or its phase
 /// of `VICTORY_AB`; off by default: each one made and let go, as before).
+        // The same for the card buffers of copies at their place: the list
+        // names them no more (its table of constant buffers first).
+        if !self.between.is_empty() {
+            self.placed_constants.clear();
+            place::between_give(self.between.drain(..));
+        }
 ///
 /// Each is a committed buffer of its own, waited for until the card has
 /// mapped it: with card steps on an RTX 5070, 23,000 of 40,000 shared
@@ -9879,6 +9889,7 @@ impl Meter {
                 let [own, asking, still, all] =
                     [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
                 if all >= 1.0 {
+            place::between_line();
                     tracing::info!(
                         "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                          is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
