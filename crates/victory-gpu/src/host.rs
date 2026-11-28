@@ -918,7 +918,9 @@ fn card_asked(at: &'static std::panic::Location<'static>, size: u64) {
 }
 
 /// With the memory line: the card buffers made since the start by where
-/// they were asked for, the most first. Nothing while none was made.
+/// they were asked for, the most first. Nothing while none was made. (Only
+/// the memory line of diagnostics builds prints it, `crate::copystat`.)
+#[cfg(feature = "diagnostics")]
 pub(crate) fn card_asked_line() {
     let mut asked = CARD_ASKED.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if asked.is_empty() {
@@ -1481,6 +1483,43 @@ mod tests {
 /// The batches of clamped records in one scratch buffer
 /// ([`HostList::batch_place`]).
 const BATCHES: u32 = 8;
+
+/// Whether lists share the scratch buffers of their batched clamps
+/// ([`HostList::batch_place`]): a list takes one when a recording first
+/// needs it and gives all of them back when it is reset, for the next list
+/// (on by default; `VICTORY_BATCH_POOL=0`: kept by their list from recording
+/// to recording, as before). Host lists that have run go into one pool from
+/// which any recording takes any of them, so every list's buffers grew to
+/// what the longest recording needs: 4,987 buffers of 64 KiB (311 MB of the
+/// card's memory) after three minutes of play on the RTX 5070 (run of
+/// 2026-11-28), still one more a frame, for some 430 lists a frame.
+fn batch_pool() -> bool {
+    crate::toggled!("VICTORY_BATCH_POOL")
+}
+
+/// At most this many buffers wait in [`BATCH_POOL`] (64 KiB each: 128 MiB).
+const BATCH_POOL_MOST: usize = 2048;
+
+/// Scratch buffers of batched clamps that no list holds ([`batch_pool`]):
+/// in the common state, as a list's close leaves them, and read by nothing,
+/// as a list is reset only once its last submission has run.
+static BATCH_POOL: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+/// Since the start: buffers taken from [`BATCH_POOL`], and made for it.
+static BATCH_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With the frame line: what [`batch_pool`] did since the start. Nothing
+/// while it has done nothing.
+fn batch_pool_line() {
+    let [taken, made] = [0, 1].map(|i| BATCH_POOL_STATS[i].load(Ordering::Relaxed));
+    if taken + made == 0 {
+        return;
+    }
+    let kept = BATCH_POOL.lock().unwrap_or_else(|e| e.into_inner()).len();
+    tracing::info!(
+        "scratch buffers of batched clamps shared by the lists (VICTORY_BATCH_POOL=0: kept by their list): {taken} taken from the pool, {made} made for it, {kept} in it now"
+    );
+}
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
@@ -4324,13 +4363,15 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
+mod font;
+mod menu;
 mod panel;
 mod place;
 pub(crate) mod rec;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
+pub use menu::set_settings_file;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -7207,6 +7248,22 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        // The same for the scratch buffers of its batched clamps: the next
+        // list to batch takes them. Those past the pool's room are let go,
+        // outside its lock.
+        if batch_pool() {
+            let mut mine = {
+                let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+                args.1 = 0;
+                std::mem::take(&mut args.0)
+            };
+            if !mine.is_empty() {
+                let mut pool = BATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                let room = BATCH_POOL_MOST.saturating_sub(pool.len()).min(mine.len());
+                pool.extend(mine.drain(..room));
+            }
+            drop(mine);
+        }
         let calls = self.calls.swap(0, Ordering::Relaxed);
         // Open and empty since it was made or last reset: the allocator holds
         // nothing, the list nothing recorded (`HostList::leave_open`).
@@ -8106,8 +8163,25 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
+            let pooled = match batch_pool() {
+                true => BATCH_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop(),
+                false => None,
+            };
+            let made = match pooled {
+                Some(taken) => {
+                    BATCH_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    taken
+                }
+                None => {
+                    // (Made with the pool's lock let go.)
+                    let made = host()?.uav_buffer(size)?;
+                    name(&made, || format!("indirect batches {size:#x}"));
+                    if batch_pool() {
+                        BATCH_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    made
+                }
+            };
             args.0.push(made);
         }
         args.1 += 1;
@@ -9783,8 +9857,10 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
+    /// The numbers panel (F3), in every build.
     panel: panel::Panel,
+    /// The F1 settings menu.
+    menu: menu::Menu,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9856,7 +9932,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -9933,6 +10008,7 @@ impl Meter {
             crate::shadow::exact_line(frames);
             upload_pool_line();
             place::between_line();
+            batch_pool_line();
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
@@ -10593,8 +10669,8 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10654,9 +10730,9 @@ impl Host {
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
+                p.menu.frame();
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
@@ -10750,8 +10826,8 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                menu: menu::Menu::new(),
             })
         }
     }

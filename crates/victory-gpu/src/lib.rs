@@ -110,6 +110,17 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+/// Where the F1 settings menu saves (`host/menu.rs`); passed on by
+/// `victory-hle` for the program.
+#[cfg(windows)]
+pub use host::set_settings_file;
+
+/// The F1 settings menu is shown (`host/menu.rs`): the input module gives
+/// the title no keyboard meanwhile. (From VIctory-NVIDIA 22c6be2,
+/// trustno1-coder.)
+#[cfg(windows)]
+pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Reserves the address space for memory shaders read by address; call it
 /// first thing, before the process's other allocations can fill [4 GiB, 2^37).
 #[cfg(windows)]

@@ -95,10 +95,14 @@ pub struct Asked {
 }
 
 impl Asked {
-    /// The switches; an unknown mode or preset name is an error.
+    /// The switches; an unknown mode or preset name is an error where it
+    /// is used: with `always` (`victory upscaler-check`, which runs DLSS
+    /// whatever the switches say), or with a switch on that reads it. Unused,
+    /// it is said in the log and the default stands, so that a line left in
+    /// the saved settings does not stop a start without DLSS.
     /// `default_dir`: where Streamline's DLLs are looked for unless
     /// `VICTORY_STREAMLINE_DIR` names another folder.
-    pub fn from_env(default_dir: PathBuf) -> Result<Self, String> {
+    pub fn from_env(default_dir: PathBuf, always: bool) -> Result<Self, String> {
         let var = |name: &str| std::env::var(name).ok();
         let on = |name: &str| var(name).is_some_and(|v| v.trim() == "1");
         // `VICTORY_DLSS=1`: DLSS in place of the title's FidelityFX upscaling.
@@ -106,25 +110,49 @@ impl Asked {
         // `VICTORY_FRAMEGEN=1`: DLSS Frame Generation on our present (needs
         // DLSS, the line of submissions and the interface plane).
         let framegen = on("VICTORY_FRAMEGEN");
+        // (`VICTORY_FSR_PATH=1`, read by the program, takes the mode's scale.)
+        let mode_used = always || dlss || framegen || on("VICTORY_FSR_PATH");
+        // Frame generation alone keeps the scene at the output's size.
+        let default_mode = if framegen && !dlss { Mode::Dlaa } else { Mode::Quality };
         // `VICTORY_DLSS_MODE`: dlaa (native), quality (the default),
         // balanced, performance, ultraperformance.
         let mode = match var("VICTORY_DLSS_MODE") {
-            Some(name) => Mode::from_name(&name).ok_or_else(|| {
-                format!(
-                    "VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, performance, \
-                     ultraperformance"
-                )
-            })?,
-            // Frame generation alone keeps the scene at the output's size.
-            None if framegen && !dlss => Mode::Dlaa,
-            None => Mode::Quality,
+            Some(name) => match Mode::from_name(&name) {
+                Some(mode) => mode,
+                None if mode_used => {
+                    return Err(format!(
+                        "VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, \
+                         performance, ultraperformance"
+                    ));
+                }
+                None => {
+                    tracing::warn!(
+                        "VICTORY_DLSS_MODE={name} is no DLSS mode; not used in this start (DLSS \
+                         and frame generation are off)"
+                    );
+                    default_mode
+                }
+            },
+            None => default_mode,
         };
         // `VICTORY_DLSS_PRESET`: the DLSS model, default (DLSS's own), e, f,
         // j, k, l or m.
         let preset = match var("VICTORY_DLSS_PRESET") {
-            Some(name) => plan::preset(&name).ok_or_else(|| {
-                format!("VICTORY_DLSS_PRESET={name}: not one of default, e, f, j, k, l, m")
-            })?,
+            Some(name) => match plan::preset(&name) {
+                Some(preset) => preset,
+                None if always || dlss => {
+                    return Err(format!(
+                        "VICTORY_DLSS_PRESET={name}: not one of default, e, f, j, k, l, m"
+                    ));
+                }
+                None => {
+                    tracing::warn!(
+                        "VICTORY_DLSS_PRESET={name} is no DLSS model; not used in this start \
+                         (DLSS is off)"
+                    );
+                    0
+                }
+            },
             None => 0,
         };
         // `VICTORY_DLSS_JITTER=x,y` and `VICTORY_DLSS_MV=x,y` (diagnostics
@@ -1880,6 +1908,9 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         }
         if code == 0 || code == 39 {
             calls.framegen_on = on;
+            if !on {
+                FG_PER.store(1, Relaxed);
+            }
             // What was asked (the driver may give fewer): not set again
             // until that changes.
             calls.framegen_times = times;
@@ -1977,6 +2008,32 @@ fn framegen_wanted() -> u32 {
     }
 }
 
+/// Frames frame generation showed for the last frame presented (1 while it
+/// is off), for the stats panel.
+static FG_PER: AtomicU32 = AtomicU32::new(1);
+
+/// Whether frame generation can be switched and changed while the title
+/// runs: it was made ready at the start and our swap chain is Streamline's
+/// proxy (the F1 menu asks). (From VIctory-NVIDIA 22c6be2, trustno1-coder.)
+pub(crate) fn framegen_live() -> bool {
+    FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)
+}
+
+/// Asks frame generation off (0) or for `times` frames shown for each one
+/// rendered (2..6), from the next present on: the F1 menu's change of
+/// `VICTORY_FRAMEGEN_X`. Nothing changes without [`framegen_live`].
+/// (From VIctory-NVIDIA 22c6be2, trustno1-coder.)
+pub(crate) fn set_framegen(times: u32) {
+    FG_WANTED.store(if times == 0 { 0 } else { times.clamp(2, 6) }, Relaxed);
+    tracing::info!(times, live = framegen_live(), "frame generation: asked from the settings menu");
+}
+
+/// For the stats panel: frames shown for each one rendered (1 without frame
+/// generation).
+pub(crate) fn shown_per_frame() -> u32 {
+    FG_PER.load(Relaxed).max(1)
+}
+
 /// Diagnostics: `VICTORY_FRAMEGEN_CYCLE=<presents>` (a check with nobody at
 /// the keys): the frames shown for each one rendered are asked anew every
 /// that many presents, in turn 2, 4, off and 6.
@@ -2038,6 +2095,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
         if code == 0 {
+            FG_PER.store(state.num_frames_actually_presented.max(1), Relaxed);
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             let before = FG_STATUS.swap(state.status, Relaxed);
@@ -2070,6 +2128,7 @@ pub(crate) fn resizing() {
         unsafe { set_options(&viewport, &options) };
         calls.framegen_on = false;
         calls.framegen_times = 0;
+        FG_PER.store(1, Relaxed);
     }
 }
 

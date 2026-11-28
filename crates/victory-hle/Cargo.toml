@@ -18,8 +18,13 @@ tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
+    # PlayStation pads read over HID (`modules::gameinput::playstation`).
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Globalization",
+    # The mouse capture's client area on screen (`modules::lifecycle`).
+    "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_Security",
     "Win32_Security_Cryptography",

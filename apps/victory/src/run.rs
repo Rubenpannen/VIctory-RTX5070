@@ -53,6 +53,10 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // The F1 settings menu saves at once to <data_dir>\victory-settings.txt,
+    // which scripts\play.ps1 applies at every start (victory-gpu's
+    // host/menu.rs; from VIctory-NVIDIA 22c6be2 and 64d4931, trustno1-coder).
+    victory_hle::set_settings_file(cfg.data_dir.join("victory-settings.txt"));
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): NVIDIA
     // Streamline is loaded before anything of the title or the host GPU, and
     // fails soft; only if it offers one of them does the title render through
@@ -63,7 +67,7 @@ pub fn run(
     // another folder. (From VIctory-NVIDIA d11233a, readmet3xt-lab.)
     use victory_hle::streamline;
     let streamline_dir = cfg.data_dir.join(r"nvidia-sdk\Streamline\bin\x64");
-    let asked = streamline::Asked::from_env(streamline_dir).map_err(anyhow::Error::msg)?;
+    let asked = streamline::Asked::from_env(streamline_dir, false).map_err(anyhow::Error::msg)?;
     let available = streamline::init(&asked);
     // Streamline shut down when the run ends, however it ends (nothing if it
     // was not loaded). Not on the title's own exit (`lifecycle`, which ends

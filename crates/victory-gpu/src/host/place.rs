@@ -88,7 +88,14 @@ static BETWEEN_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::syn
 /// A buffer of `size` bytes that no list and no slot holds any more.
 fn between_take(size: u64) -> Option<ID3D12Resource> {
     let mut pool = BETWEEN_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let at = pool.1.iter().take(BETWEEN_POOL_LOOKS).position(|(b, s)| *s == size && references(b) == 1)?;
+    let looked = pool.1.len().min(BETWEEN_POOL_LOOKS);
+    let Some(at) = pool.1.iter().take(looked).position(|(b, s)| *s == size && references(b) == 1) else {
+        // Those looked at go behind the others: left in front, buffers of
+        // another size or that a slot still shows kept every later taking
+        // from the free ones behind them.
+        pool.1.rotate_left(looked);
+        return None;
+    };
     let (buffer, _) = pool.1.remove(at)?;
     pool.0 -= size;
     Some(buffer)

@@ -33,6 +33,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_BAKE_EXACT` | Makes a draw of the title's bake see textures picked by index as title memory holds them at that moment. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_BAKE_TEXTURES_MS` | Sets the milliseconds a frame the texture-upload pass may take, during a bake, before a shader that picks by index asks. | 1500 ms | &lt;milliseconds, integer> |
 | `VICTORY_BARRIER_TEST` | Timing experiment that drops some of the title's or our barrier waits for earlier shader writes; can give wrong pictures. *Diagnostics build only.* | off | groups = drop shader-write waits of barrier groups; indirect = drop the two waits of the indirect pass; both = both; other = off |
+| `VICTORY_BATCH_POOL` | Lets command lists share the card scratch buffers of their batched indirect clamps, taking one when first needed and giving all back on reset, instead of each list keeping its own. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_BCPACK_CASES` | Test only: directory of packed BCPack chunks with reference outputs to compare the decoder against. | not set (test only) | &lt;directory path> of packed chunks with .out references |
 | `VICTORY_BCPACK_TABLES` | Test only: the BCPack format table file used when comparing against reference outputs. | not set (test only) | &lt;file path> of the BCPack table file |
 | `VICTORY_BENCH_CS` | Benchmark test only: times a different compute shader source for the card-compare pass. | not set (test only) | &lt;file path> of alternative compute shader source |
@@ -116,6 +117,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_DSTORAGE_RETRIES` | Sets how many times a streaming write into not-yet-ready pages is retried before the request fails. | 12 | &lt;retries, integer>; waits grow from 2 ms to 128 ms |
 | `VICTORY_DSTORAGE_STAGING_MB` | Raises the streaming staging buffer to at least this many MiB, above what the title asks for. | 0 (what the title asks for) | &lt;MiB, integer>; staging buffer is at least this big |
 | `VICTORY_DSTORAGE_TRACE` | Traces the streaming system: per batch and unexpected changes, or per request. | 0 (off) | 0 = off; 1 = line per batch and per faulty request; 2 = line per request |
+| `VICTORY_DUALSENSE` | Reads PlayStation pads (DualShock 4, also through the 0x0BA0 adapter; DualSense; DualSense Edge) over HID, USB or Bluetooth, with rumble; looked for every 2 seconds while no XInput pad is there. | auto (only while XInput lists no pad) | 0 = never; 1 = beside XInput pads too; unset = auto |
 | `VICTORY_DUMP_MATCH` | Dumps shader containers whose description line contains one of the texts to a folder, as the title has them. | off | &lt;folder>;&lt;text> or several texts separated by a vertical bar; a text is a name or #hash |
 | `VICTORY_DUMP_TARGETS` | Saves the title textures that captured frames render to or write, in first-use order. *Diagnostics build only.* | off | on when set and not 0; needs VICTORY_CAPTURE |
 | `VICTORY_DXIL` | Path of dxil.dll, the validator that checks translated shaders in tests and the offline batch. | newest Windows SDK's dxil.dll | &lt;path of dxil.dll> |
@@ -144,10 +146,12 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_FRAMEGEN_CYCLE` | Every N presents, asks frame generation for 2x, 4x, off and 6x in turn (an unattended test). *Diagnostics build only.* | 0 (off) | &lt;presents, integer> |
 | `VICTORY_FRAMEGEN_HUDLESS` | With frame generation, tags the scene plane (the frame without the interface, `VICTORY_UI_PLANE`) for it. | on | 0 = not tagged; anything else = on |
 | `VICTORY_FRAMEGEN_ROOM_MB` | Lowers the texture queue's room line by this much while frame generation is ready, for what frame generation allocates. | 1024 | &lt;MiB, integer>; 0 = not lowered |
-| `VICTORY_FRAMEGEN_X` | Frames shown per frame rendered with frame generation. *Set by `scripts\play.ps1`* (`-FrameGen`). | 2 | 2 to 6; 0 = made ready but off |
+| `VICTORY_FRAMEGEN_X` | Frames shown per frame rendered with frame generation; the F1 menu changes it while the title runs once frame generation is ready. *Set by `scripts\play.ps1`* (`-FrameGen`). | 2 | 2 to 6; 0 = made ready but off |
 | `VICTORY_FRAME_INTERVAL_MS` | Sets the title's frame interval, patched into the title's code and used by our frame clock. | not set (title's own) | &lt;milliseconds, decimal 0 to 1000>; 0 = no wait at all |
 | `VICTORY_FRESH_OPEN` | Leaves the host list made for a title's new list open for its next reset instead of closing it at once. | on | 0 = closed at once, as before; anything else = on |
 | `VICTORY_FSR_PATH` | Puts the title on its FidelityFX path at `VICTORY_DLSS_MODE`'s scale with its own FSR, without Streamline, to compare with DLSS (the title's FSR4 only works at 1280x720 in, 1920x1080 out). | off | 1 = on; unset/other = off |
+| `VICTORY_FULLSCREEN` | Shows the title's window borderless over the whole screen. The F1 menu sets it (next start). | off | 1 = on; unset/other = off |
+| `VICTORY_FULLSCREEN_RES` | The size of the borderless window `VICTORY_FULLSCREEN=1` makes. | the main screen's size | &lt;width>x&lt;height> |
 | `VICTORY_FULL_CARD_PASS` | When the card is full, holds back texture slots needing a new host copy and carries on with the slots behind them. | on | 0 = off; anything else or unset = on |
 | `VICTORY_GAME_DIR` | Sets the folder holding the title's files, overriding the one in victory.toml. | from victory.toml | &lt;folder path> |
 | `VICTORY_GPU_LOAD_MS` | Makes the title's four per-frame GPU timestamps report the given load, so its GPU time looks non-zero. | 0 (timestamps as they are) | &lt;milliseconds, integer> of GPU time to report per frame |
@@ -171,6 +175,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_HOST_MAX_WAVE` | Older name for VICTORY_HOST_WAVE: the host's wave size that offline shader translation is done for. | from this PC's card | &lt;lanes, integer>; used when VICTORY_HOST_WAVE is not set |
 | `VICTORY_HOST_WAVE` | Sets the host wave size (lanes) that offline shader translation is done for. | from this PC's card | &lt;lanes, integer>, e.g. 32 or 64 |
 | `VICTORY_IMAGE_WATCH` | Logs chosen words of the title's image once a second, to compare two launches' internal counters. | off | &lt;name=hexoffset:bytes, comma-separated>; bytes 1/2/4/8, default 8 |
+| `VICTORY_IME_ENGLISH` | Switches the title's window to the English (en-US) keyboard layout when it is made and each time it gets the focus. The F1 menu sets it (next start). | off | 1 = on; unset/other = off |
 | `VICTORY_INDIRECT_BATCH` | Clamps the executions of one indirect record in batches instead of one by one. *Set by `scripts\play.ps1`.* | 1 | 0 = each execution on its own; 1 = batched; 2 = batches continue across dispatches until the title waits or draws |
 | `VICTORY_INDIRECT_CARD_BUDGET` | Keeps a list's indirect-work budget in the card's own memory rather than in CPU-mapped memory. | on | 0 = off; anything else or unset = on |
 | `VICTORY_INDIRECT_REST` | Lets a record that overflows the list's remaining indirect budget take the rest, so later records run empty too. | on | 0 = off; anything else or unset = on |
@@ -223,6 +228,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_LIST_SLOTS` | Lists the heap slots textures are picked from after draws whose pixel shader matches the given hashes. *Diagnostics build only.* | none | &lt;shader hash prefixes, comma-separated> |
 | `VICTORY_LIST_VIEWS` | Makes a view that a list's tables hold once per list instead of once per table. | on | 0 = off; anything else or unset = on |
 | `VICTORY_LOG` | Sets the log filter for every binary, falling back to RUST_LOG. | info (debug builds of tools may differ) | &lt;tracing filter>, e.g. victory_loader=trace,info; falls back to RUST_LOG |
+| `VICTORY_LOG_FILE` | Writes the log to this file too, without colours; a path inside this repository is refused (the log holds the title's data). *Cleared by `scripts\play.ps1` unless given with `-More` (its `-Log` writes a file of its own).* | not set (no file) | &lt;file path>; empty = no file |
 | `VICTORY_LOW_EARLY_MB` | Reserves this much address space in [4 GiB, 2^37) at host creation, in 64 MiB pieces, for the ray-tracing builder's memory arenas. | 3200 with `VICTORY_BVH_BUILDER=1`, else 0 | &lt;megabytes, integer>; 0 = none reserved |
 | `VICTORY_MAPPED_BY_PAGE` | Measures how much title memory is mapped one 4 KiB page at a time, without walking ranges. | off | 1 = on; unset or anything else = off |
 | `VICTORY_MAPPED_BY_VIEWS` | Asks the runtime's own views of physical pages how much title memory is mapped before asking Windows. | on | 0 = off; anything else or unset = on |
@@ -233,23 +239,27 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_MEMORY_CATEGORIES` | Logs a periodic line showing where submission copies of title memory go, by category. *Diagnostics build only.* | off | set to anything except 0 = on; unset or 0 = off |
 | `VICTORY_MEMORY_DUMP` | Writes the card's memory arenas to files in the named folder when a file named go appears there. *Diagnostics build only.* | off | &lt;folder path>; a file named go there triggers the dump |
 | `VICTORY_MEMORY_MAP` | Sets how often the address space is walked to log the memory map line. *Diagnostics build only.* | 60 | &lt;memory lines (one per 5 s), integer> |
+| `VICTORY_MENU_OPEN` | Shows the F1 settings menu from the start. *Diagnostics build only.* | off | 1 = on; unset/other = off |
 | `VICTORY_MESH_LAUNCH` | Puts an amplification shader of ours in front of every translated mesh shader to launch mesh draws. | off | set to anything except 0 = on; unset or 0 = off |
 | `VICTORY_MESH_OUTPUT_STRICT` | Refuses mesh shaders whose outputs pass the host's 32 KiB cap instead of emitting them with lower maxima. | off | set to any value (even 0) = on; unset = off |
 | `VICTORY_MESH_TEST` | Skips mesh draws or shrinks them to one pixel, to tell a hang caused by shaders from one caused by coverage. | off | skip = issue no mesh draws; scissor = one-pixel draws; anything else = off |
 | `VICTORY_METER_THREAD` | Makes the frame meter's five-second lines on a thread of ours so presenting is not held up. | on | 0 = meter lines on the presenting thread; anything else or unset = own thread |
+| `VICTORY_MOUSE_CAPTURE` | Keeps the pointer inside the title's window and hides it while the window is in front, and gives the title a GameInput mouse, so the camera follows the mouse. The F1 menu sets it (next start). | off | 1 = on; unset/other = off |
+| `VICTORY_MOUSE_WARP` | With `VICTORY_MOUSE_CAPTURE=1`, puts the pointer back in the window's centre after each reading, so that it never stops at the window's edge. | on | 0 = off (the pointer stays where it is); anything else (or unset) = on |
 | `VICTORY_NAN_GUARD` | Guards translated shader maths against not-a-number results. | on | 0 = off; anything else or unset = on |
 | `VICTORY_NONE_SUCH` | Not a real switch: a made-up name used by a unit test to check the A/B picker. *Diagnostics build only.* | not set (test only) | none; a made-up name used only by a unit test |
 | `VICTORY_ONE_PAD` | Shows the title one always-present pad fed by the keyboard and every host pad. | on | 0 = each host pad shown separately; anything else or unset = one always-present pad |
 | `VICTORY_OPEN_ONE_VIEW` | Opens only the written view on a write fault and leaves the page's other views read-only. | on | 0 = off; anything else or unset = on |
 | `VICTORY_OUTPUT` | Sets the title's output size by patching its display mode. *Set by `scripts\play.ps1`.* | not set (title's own) | &lt;width>x&lt;height>: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160 |
 | `VICTORY_OWNERLESS_VIEWS` | Caps how many table entries of views without a resource are kept; past it the oldest is freed (stops a memory leak in long sessions). | 1048576 | &lt;entries, integer>; 0 = keep all, as before |
+| `VICTORY_PAD_SECONDS` | Test only: how long the ignored pad test reads a real pad. | 20 (test only) | &lt;seconds, integer> |
 | `VICTORY_PAGE_PARTS` | Copies only the 4 KiB parts of a page the kernel says were written, not the whole 64 KiB page. | on | 0 = off; anything else or unset = on |
 | `VICTORY_PAGE_WRITES` | Chooses what happens when title memory is written without the page guards noticing: reopen guarded host copies and/or mark texture slots due. | 1 (guarded blocks reopened) | 0 = count only; 1 = blocks and texture slots; slots = texture slots only; all = everything; guards/unset/other = blocks only |
 | `VICTORY_PAIRS` | In the offline shader translation walk, keeps the named vertex+pixel shader pairs (label substrings) so their pipelines are built afterwards. | none | comma-separated vs+ps pairs of label substrings |
 | `VICTORY_PAIR_CHEAP` | Pair meetings of 32-lane host waves meet once per exchange (two buffers) and read their counter with one fenced load. Changes translations. | on | 0 = two meetings and an atomic per lane per read, as before; anything else = on |
 | `VICTORY_PAIR_LDS_ORDER` | No pair meeting around LDS accesses whose order does not matter. Changes translations. | on | 0 = a meeting before every LDS access, as before; anything else = on |
 | `VICTORY_PAIR_REGIONS` | With pair meetings, loop branches get their own lane region, and title barriers inside wave-wide branches become fences only when `VICTORY_GROUP_SYNC=1` (otherwise they still wait for the group). Changes translations. | on | 0 = as before; anything else = on |
-| `VICTORY_PANEL` | Draws the run's numbers as white text on a black box in the picture's upper-left corner; F3 shows or hides it. *Diagnostics build only.* | off | 0 or unset = off; anything else = on (F3 shows/hides) |
+| `VICTORY_PANEL` | Draws the run's numbers as white text on a black box in the picture's upper-left corner; F3 shows or hides it. In every build; F3 or the F1 menu turn it on and off while the title runs. | off | 0 or unset = off; anything else = on (F3 shows/hides) |
 | `VICTORY_PATCH_CLZERO` | Replaces each faulting cache-zeroing loop in the title's code with plain stores the first time it faults, so it stops raising exceptions. | on | 0 = off; anything else = on |
 | `VICTORY_PATCH_WAITS` | Replaces the title's console wait instructions (monitorx/mwaitx) with harmless ones the first time they fault, instead of emulating them each time. | on | 0 = off; anything else = on |
 | `VICTORY_PC_DXC` | Path to the PC dxc.exe used to compile the helper shaders the host builds itself; otherwise it is looked for beside dxil.dll. | dxc.exe beside the validator's dxil.dll | &lt;path to dxc.exe> |

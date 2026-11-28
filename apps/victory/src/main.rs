@@ -206,6 +206,14 @@ fn main() -> Result<()> {
     // e69e39c, trustno1-coder). Address space only; nothing is committed.
     #[cfg(windows)]
     victory_hle::reserve_upload_space();
+    // `VICTORY_LOG_FILE=<path>`: the log is also written to that file
+    // (victory_core::logging; from VIctory-NVIDIA 48ad785, trustno1-coder).
+    // It holds the title's data, so a path inside this repository is refused
+    // here, before anything is logged (docs/asset-policy.md). Unset or empty:
+    // no file.
+    if let Some(path) = std::env::var_os("VICTORY_LOG_FILE").filter(|p| !p.is_empty()) {
+        victory_core::ensure_outside_repo(std::path::Path::new(&path))?;
+    }
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -288,7 +296,7 @@ fn upscaler_check(output: &str, device: bool, present: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
     let cfg = victory_core::Config::load()?;
     let folder = cfg.data_dir.join("nvidia-sdk").join("Streamline").join("bin").join("x64");
-    let asked = victory_hle::streamline::Asked::from_env(folder).map_err(anyhow::Error::msg)?;
+    let asked = victory_hle::streamline::Asked::from_env(folder, true).map_err(anyhow::Error::msg)?;
     for line in victory_hle::streamline::check(asked, size, device || present, present) {
         println!("{line}");
     }

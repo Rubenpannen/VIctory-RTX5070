@@ -31,7 +31,9 @@ the log says what, and the title upscales and presents as it does without them.
    - `victory upscaler-check --present`: as `--device`, then three seconds of frame generation in
      a window of ours, with how many frames it showed.
 3. Play with `scripts\play.ps1 -Dlss quality` (or `dlaa`, `balanced`, `performance`), and with
-   frame generation `-Dlss quality -FrameGen` (`-FrameGenX 2` to `6`).
+   frame generation `-Dlss quality -FrameGen` (`-FrameGenX 2` to `6`). The in-game F1 menu
+   sets DLSS, its mode and frame generation for the next start, and the frames shown per frame
+   rendered (2x to 6x) at once while frame generation runs.
 
 Needed: a GeForce RTX card (frame generation: RTX 40 or later), Windows 10 2004 or later,
 hardware-accelerated GPU scheduling on (frame generation needs it).

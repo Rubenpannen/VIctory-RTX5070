@@ -41,6 +41,10 @@ pub use victory_gpu::reserve_upload_space;
 /// readmet3xt-lab).
 #[cfg(windows)]
 pub use victory_gpu::streamline;
+/// Where the F1 settings menu saves (`victory-settings.txt` in the data
+/// folder, which only the program knows).
+#[cfg(windows)]
+pub use victory_gpu::set_settings_file;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

@@ -1,7 +1,8 @@
 # Fetches the NVIDIA files DLSS and DLSS frame generation need (about 70 MB) from NVIDIA's own GitHub
 # (NVIDIA-RTX/Streamline's release) into <data_dir>\nvidia-sdk\Streamline\bin\x64, where victory looks
 # for them unless VICTORY_STREAMLINE_DIR names another folder (docs/dlss.md). data_dir is
-# VICTORY_DATA_DIR, else victory.toml's data_dir, else %LOCALAPPDATA%\victory\data, as victory takes it.
+# VICTORY_DATA_DIR, else data_dir of victory.toml (or of the file VICTORY_CONFIG names), else
+# %LOCALAPPDATA%\victory\data, as victory and scripts\play.ps1 take it.
 # They are NVIDIA's, under NVIDIA's licences (saved beside them: read them); this repository does not and
 # may not carry them, so they are kept outside it. Nothing of NVIDIA's is needed to build: the files are
 # loaded when the title runs, after a check that NVIDIA signed each of them.
@@ -20,15 +21,24 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if ($To) {
     $sdk = $To
 } else {
+    # As scripts\play.ps1 finds it: VICTORY_DATA_DIR, else data_dir of victory.toml (or of the file
+    # VICTORY_CONFIG names), else %LOCALAPPDATA%\victory\data; a relative one counts from the
+    # repository's folder, where play.ps1 runs victory.
     $data = $env:VICTORY_DATA_DIR
-    $toml = Join-Path $root 'victory.toml'
-    if (-not $data -and (Test-Path $toml)) {
-        $line = Select-String -Path $toml -Pattern '^\s*data_dir\s*=\s*[''"](.+)[''"]' | Select-Object -First 1
-        if ($line) { $data = $line.Matches[0].Groups[1].Value }
+    if (-not $data) {
+        $toml = if ($env:VICTORY_CONFIG) { $env:VICTORY_CONFIG } else { 'victory.toml' }
+        if (-not [System.IO.Path]::IsPathRooted($toml)) { $toml = Join-Path $root $toml }
+        if (Test-Path $toml) {
+            $line = Select-String -Path $toml -Pattern '^\s*data_dir\s*=\s*[''"](.+)[''"]' | Select-Object -First 1
+            if ($line) { $data = $line.Matches[0].Groups[1].Value }
+        }
     }
     if (-not $data) { $data = Join-Path $env:LOCALAPPDATA 'victory\data' }
+    if (-not [System.IO.Path]::IsPathRooted($data)) { $data = Join-Path $root $data }
     $sdk = Join-Path $data 'nvidia-sdk'
 }
+# (GetFullPath counts a relative path from the process's folder, not from where this window is.)
+if (-not [System.IO.Path]::IsPathRooted($sdk)) { $sdk = Join-Path (Get-Location).Path $sdk }
 $sdk = [System.IO.Path]::GetFullPath($sdk)
 if ($sdk.StartsWith($root.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
     Write-Host "NVIDIA's files may not be inside this repository (docs/asset-policy.md): not $sdk."

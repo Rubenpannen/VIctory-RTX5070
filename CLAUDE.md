@@ -64,7 +64,10 @@ the title's output size (`VICTORY_OUTPUT`, 2560x1440 by default), `-RenderScale`
 (`VICTORY_RENDER_SCALE`, 1.0 by default), `-Console series-x|series-s` the console the title sees,
 `-Build diag|release` the binary, `-More @{...}` adds switches, and `-Log` / `-LogFile <path>` also
 write the log to a file (under the data folder by default; it holds the title's data, so the script
-refuses a path inside the repo). Ahead of a run: `victory shaders <archives>`
+refuses a path inside the repo). `-Dlss <mode>`, `-FrameGen` and `-FrameGenX 2..6` turn on DLSS and
+frame generation (`docs/dlss.md`). In the title, F3 shows the stats panel and F1 the settings menu,
+which saves to `<data_dir>\victory-settings.txt`; `play.ps1` applies that file over its defaults
+and under its command line (`-NoSaved`, and `-Safe`, leave it out). Ahead of a run: `victory shaders <archives>`
 (translate every shader into the cache) and `victory warm --used` (pre-build host pipelines for the
 driver's cache). Other subcommands (`inspect`, `census`, `translate`, `replay`, `config`, ...) are in
 `apps/victory/src/main.rs`.

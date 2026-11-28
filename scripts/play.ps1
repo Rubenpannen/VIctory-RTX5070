@@ -19,6 +19,12 @@
 # -Log          also write the whole log to <data_dir>\logs\play-<date>-<time>.log (data_dir from
 #               victory.toml or VICTORY_DATA_DIR); -LogFile <path> writes it there instead. The log
 #               holds the title's data, so it may not be inside this repository (docs/asset-policy.md).
+# -NoSaved      leave out what the F1 settings menu saved (-Safe does too)
+#
+# Saved settings: what the in-game F1 menu saved, <data_dir>\victory-settings.txt (one
+# VICTORY_NAME=value a line; an empty value: unset), applies over this script's own settings but
+# under what is given on the command line (-Dlss, -FrameGen, -FrameGenX, -Display, -RenderScale,
+# -RayTracing, -More). F3 in the game shows and hides the stats panel.
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -34,8 +40,110 @@ param(
     [ValidateRange(2, 6)][int]$FrameGenX = 2,
     [hashtable]$More = @{},
     [switch]$Log,
-    [string]$LogFile = ''
+    [string]$LogFile = '',
+    [switch]$NoSaved
 )
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+# Paths victory takes from this window (kept below, never taken from the saved settings).
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
+$modes = '3840x2160', '2560x1440', '1920x1080', '1664x936', '1280x720'
+$dlssModes = 'dlaa', 'quality', 'balanced', 'performance'
+$scalePattern = '^(title|0\.[5-9]\d*|1(\.0*)?)$'
+
+# The data folder, as victory finds it (victory_core::Config): VICTORY_DATA_DIR, else victory.toml's
+# data_dir (or that of the file VICTORY_CONFIG names), else %LOCALAPPDATA%\victory\data.
+$data = $env:VICTORY_DATA_DIR
+if (-not $data) {
+    $toml = if ($env:VICTORY_CONFIG) { $env:VICTORY_CONFIG } else { 'victory.toml' }
+    if (-not [System.IO.Path]::IsPathRooted($toml)) { $toml = Join-Path $root $toml }
+    if (Test-Path $toml) {
+        $line = Select-String -Path $toml -Pattern '^\s*data_dir\s*=\s*[''"](.+)[''"]' | Select-Object -First 1
+        if ($line) { $data = $line.Matches[0].Groups[1].Value }
+    }
+}
+if (-not $data -and $env:LOCALAPPDATA) { $data = Join-Path $env:LOCALAPPDATA 'victory\data' }
+if ($data -and -not [System.IO.Path]::IsPathRooted($data)) { $data = Join-Path $root $data }
+
+# What the F1 menu saved (crates\victory-gpu\src\host\menu.rs), unless -NoSaved or -Safe (the
+# first thing to try when something is wrong: none of the saved speed switches either).
+$savedFile = if ($data) { Join-Path $data 'victory-settings.txt' } else { $null }
+if ($Safe -and -not $NoSaved -and $savedFile -and (Test-Path $savedFile)) {
+    Write-Host "-Safe: the settings the F1 menu saved ($savedFile) are left out."
+    $NoSaved = $true
+}
+$saved = [ordered]@{}
+if (-not $NoSaved -and $savedFile -and (Test-Path $savedFile)) {
+    foreach ($line in Get-Content $savedFile) {
+        if ($line -match '^\s*(VICTORY_[A-Z0-9_]+)\s*=(.*)$' -and $Matches[1] -notin $paths) {
+            $saved[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+}
+$given = @($PSBoundParameters.Keys)
+$applied = New-Object System.Collections.Generic.List[string]
+$overruled = New-Object System.Collections.Generic.List[string]
+$fromSaved = @{}
+# A saved line taken (or one the command line kept its own value over).
+function Register-Saved([string]$name, [bool]$taken) {
+    $text = if ($saved[$name] -eq '') { "$name=(unset)" } else { "$name=$($saved[$name])" }
+    if ($taken) { $applied.Add($text) } else { $overruled.Add($name) }
+}
+function Skip-Saved([string]$name, [string]$why) {
+    $applied.Remove("$name=$($saved[$name])") | Out-Null
+    Write-Host "Saved $name=$($saved[$name]) left out: $why ($savedFile; -NoSaved: without saved settings)."
+}
+
+# The saved switches this script has options for set those options, unless they were given.
+if ($saved.Contains('VICTORY_DLSS') -or $saved.Contains('VICTORY_DLSS_MODE')) {
+    $names = @('VICTORY_DLSS', 'VICTORY_DLSS_MODE') | Where-Object { $saved.Contains($_) }
+    if ('Dlss' -in $given) {
+        $names | ForEach-Object { Register-Saved $_ $false }
+    } else {
+        $on = if ($saved.Contains('VICTORY_DLSS')) { $saved['VICTORY_DLSS'] -eq '1' } else { $Dlss -ne 'off' }
+        $mode = if ($saved['VICTORY_DLSS_MODE']) { $saved['VICTORY_DLSS_MODE'] } elseif ($Dlss -ne 'off') { $Dlss } else { 'quality' }
+        if ($on -and $mode -notin $dlssModes) {
+            Skip-Saved 'VICTORY_DLSS_MODE' "not one of $($dlssModes -join ', ')"
+        } else {
+            $Dlss = if ($on) { $mode } else { 'off' }
+            $fromSaved.Dlss = $true
+            $names | ForEach-Object { Register-Saved $_ $true }
+        }
+    }
+}
+if ($saved.Contains('VICTORY_FRAMEGEN')) {
+    if ('FrameGen' -in $given) { Register-Saved 'VICTORY_FRAMEGEN' $false } else {
+        $FrameGen = $saved['VICTORY_FRAMEGEN'] -eq '1'
+        $fromSaved.FrameGen = $true
+        Register-Saved 'VICTORY_FRAMEGEN' $true
+    }
+}
+# Frames shown per frame rendered; 0 (ready but off, switched on from the F1 menu) only from there.
+$fgTimes = "$FrameGenX"
+if ($saved.Contains('VICTORY_FRAMEGEN_X')) {
+    $value = $saved['VICTORY_FRAMEGEN_X']
+    if ('FrameGenX' -in $given) { Register-Saved 'VICTORY_FRAMEGEN_X' $false }
+    elseif ($value -eq '') { Register-Saved 'VICTORY_FRAMEGEN_X' $true }
+    elseif ($value -match '^[02-6]$') { $fgTimes = $value; Register-Saved 'VICTORY_FRAMEGEN_X' $true }
+    else { Skip-Saved 'VICTORY_FRAMEGEN_X' 'not 0 or 2 to 6' }
+}
+if ($saved.Contains('VICTORY_OUTPUT')) {
+    $value = $saved['VICTORY_OUTPUT']
+    if ('Display' -in $given) { Register-Saved 'VICTORY_OUTPUT' $false }
+    elseif ($value -eq '' -or $value -in $modes) {
+        $Display = if ($value -eq '') { 'console' } else { $value }
+        $fromSaved.Display = $true
+        Register-Saved 'VICTORY_OUTPUT' $true
+    } else { Skip-Saved 'VICTORY_OUTPUT' "not one of $($modes -join ', ')" }
+}
+if ($saved.Contains('VICTORY_RENDER_SCALE')) {
+    $value = $saved['VICTORY_RENDER_SCALE']
+    if ('RenderScale' -in $given) { Register-Saved 'VICTORY_RENDER_SCALE' $false }
+    elseif ($value -eq '' -or $value -match $scalePattern) {
+        $RenderScale = if ($value -eq '') { 'title' } else { $value }
+        Register-Saved 'VICTORY_RENDER_SCALE' $true
+    } else { Skip-Saved 'VICTORY_RENDER_SCALE' 'not 0.5 to 1.0' }
+}
+
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
@@ -61,7 +169,6 @@ if ($Safe) {
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 # The title takes its output size from its own settings (3840x2160 in a Series X dump), not from
 # the display mode it is told of: VICTORY_OUTPUT patches it to one of the sizes it has a mode for.
-$modes = '3840x2160', '2560x1440', '1920x1080', '1664x936', '1280x720'
 $output = $Display
 if ($Display -eq 'monitor') {
     # In real pixels (unlike Windows.Forms, which a window without DPI awareness gets scaled).
@@ -71,31 +178,58 @@ if ($Display -eq 'monitor') {
     if ($size -notin $modes) { Write-Host "This screen ($size) is no size the title has a mode for: $output." }
 }
 if ($output -ne 'console') { $settings.VICTORY_OUTPUT = $output }
-if ($FrameGen -and $Dlss -eq 'off') { Write-Host '-FrameGen needs -Dlss (frame generation alone stops the title).'; exit 1 }
-if ($FrameGen -and $Safe) { Write-Host '-FrameGen needs the line of submissions -Safe leaves out (VICTORY_THIN).'; exit 1 }
+# Frame generation from the saved settings that cannot run is left out (with a line saying so);
+# given on the command line, the start stops.
+$fgSaved = $FrameGen -and $fromSaved.FrameGen
+if ($FrameGen -and $Dlss -eq 'off') {
+    if ($fgSaved) { Skip-Saved 'VICTORY_FRAMEGEN' 'frame generation needs DLSS'; $FrameGen = $false } else {
+        $where = if ($fromSaved.Dlss) { " DLSS is off in the saved settings ($savedFile)." } else { '' }
+        Write-Host "-FrameGen needs -Dlss (frame generation alone stops the title).$where"; exit 1
+    }
+}
+if ($FrameGen -and $Safe) {
+    if ($fgSaved) { Skip-Saved 'VICTORY_FRAMEGEN' 'not with -Safe'; $FrameGen = $false } else {
+        Write-Host '-FrameGen needs the line of submissions -Safe leaves out (VICTORY_THIN).'; exit 1
+    }
+}
 if ($FrameGen -and $output -in 'console', '3840x2160') {
     # The frame without the interface is the scene plane, which a 3840x2160 output does not have.
-    Write-Host '-FrameGen needs an output smaller than 3840x2160 (the interface on a plane of its own).'; exit 1
+    if ($fgSaved) { Skip-Saved 'VICTORY_FRAMEGEN' 'it needs an output smaller than 3840x2160'; $FrameGen = $false } else {
+        $where = if ($fromSaved.Display) { " The output size is from the saved settings ($savedFile)." } else { '' }
+        Write-Host "-FrameGen needs an output smaller than 3840x2160 (the interface on a plane of its own).$where"; exit 1
+    }
 }
 if ($Dlss -ne 'off') {
     # DLSS sets the scene's size; the render scale below is left out then (said in the log), and
     # applies only if DLSS is not available (NVIDIA's files missing, another card).
     $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss
-    if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = "$FrameGenX" }
+    if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = $fgTimes }
 }
 if ($RenderScale -ne 'title') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
 $shown = if ($output -eq 'console') { 'the title''s own (3840x2160)' } else { $output }
 $scale = if ($Dlss -ne 'off') {
-    "DLSS $Dlss" + $(if ($FrameGen) { ", frame generation ${FrameGenX}x" } else { '' })
+    $fg = if (-not $FrameGen) { '' } elseif ($fgTimes -eq '0') { ', frame generation ready (off)' } else { ", frame generation ${fgTimes}x" }
+    "DLSS $Dlss$fg"
 } elseif ($RenderScale -eq 'title') { 'its own 2/3' } else { $RenderScale }
 Write-Host "Output size: $shown; render scale: $scale"
+# The other saved switches, over this script's own; an empty value removes one.
+$options = 'VICTORY_DLSS', 'VICTORY_DLSS_MODE', 'VICTORY_FRAMEGEN', 'VICTORY_FRAMEGEN_X', 'VICTORY_OUTPUT', 'VICTORY_RENDER_SCALE'
+foreach ($k in $saved.Keys) {
+    if ($k -in $options) { continue }
+    if ($k -in $More.Keys -or ($k -eq 'VICTORY_BVH_BUILDER' -and 'RayTracing' -in $given)) { Register-Saved $k $false; continue }
+    if ($saved[$k] -eq '') { $settings.Remove($k) } else { $settings[$k] = $saved[$k] }
+    Register-Saved $k $true
+}
+if ($saved.Count) {
+    $kept = if ($overruled.Count) { "; the command line's kept over $($overruled -join ', ')" } else { '' }
+    Write-Host "Saved settings (F1 menu, $savedFile): $($applied -join ', ')$kept. -NoSaved: without them."
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
@@ -106,15 +240,8 @@ if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
 $Exe = (Resolve-Path $Exe).Path
-$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 if ($Log -and -not $LogFile) {
-    $data = $env:VICTORY_DATA_DIR
-    $toml = Join-Path $root 'victory.toml'
-    if (-not $data -and (Test-Path $toml)) {
-        $line = Select-String -Path $toml -Pattern '^\s*data_dir\s*=\s*[''"](.+)[''"]' | Select-Object -First 1
-        if ($line) { $data = $line.Matches[0].Groups[1].Value }
-    }
     if (-not $data) { Write-Host "No data_dir in victory.toml or VICTORY_DATA_DIR: give -LogFile <path>."; return }
     $LogFile = Join-Path $data "logs\play-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 }
