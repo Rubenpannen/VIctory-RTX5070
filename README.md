@@ -56,9 +56,11 @@ What sets the frame now, at 1920x1080:
 - **One wait of 30-36 ms a frame on the submitting thread.** The title copies a few
   hundred bytes out of memory a dispatch still in flight writes, into constant
   buffers that draws of later lists read; those are filled on the CPU at
-  submission, so the submission waits for the card. `VICTORY_PLACED_ORDER=1` ends
-  the wait, but the fills then done on the card (about 8,000 a frame) take the
-  submitting thread as long (112 -> 132 ms), so it stays off.
+  submission, so the submission waits for the card. `VICTORY_PLACED_ORDER=1`, which
+  `scripts\play.ps1` sets since 2026-11-28, ends the wait (34.6 -> 2.5 ms a frame in
+  an A/B run), but about 22 ms of it come back as work of the same thread (the
+  title's bytes put under flights' writes, copies in the card's memory), so the
+  frame is only about 4 ms shorter (96 -> 92 ms).
 - **The card itself**, about 37-41 ms a frame, the next wall after that.
 
 New on this fork:

@@ -159,6 +159,9 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    # A submission is cut behind a copy at its place that later lists read on the CPU, instead of waiting for
+    # the flights: the wait 34.6 -> 2.5 ms a frame, the frame about 4 ms shorter (A/B run of 2026-11-28).
+    $settings.VICTORY_PLACED_ORDER = '1'
     # Below 4K output, the interface on a 3840x2160 plane of its own (its menus are laid out in 4K pixels).
     $settings.VICTORY_UI_PLANE = '1'
     # Two presents in the line: the title records the next frame while ours sends this one
