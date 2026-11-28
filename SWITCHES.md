@@ -8,7 +8,8 @@ comment where a switch is read disagree, the comment is right.
 - **Diagnostics build only**: the switch exists only in a build with `--features diagnostics`
   (`target\diag`); a release build ignores it.
 - **Set by `scripts\play.ps1`**: the launcher sets it (some only with `-Safe`, `-RayTracing`,
-  `-Display` or `-RenderScale`); `-More @{...}` overrides it.
+  `-Display` or `-RenderScale`); `-More @{...}` overrides it. `-NvidiaDefaults` sets more, which
+  their rows do not say: the list is in the script.
 - **Test only / build time**: read only by tests, or stamped in when building; not a switch to set
   when playing.
 

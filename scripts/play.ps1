@@ -15,6 +15,9 @@
 #               turns out not to be available)
 # -FrameGen     DLSS frame generation as well (needs -Dlss, not with -Safe); -FrameGenX 2 to 6:
 #               frames shown per frame rendered (2 by default)
+# -NvidiaDefaults  also the switches VIctory-NVIDIA's launcher sets and this script does not (the
+#               list is below, with what each does); not with -Safe. None of them is measured on
+#               this PC yet: play the same scene with and without it.
 # -More        other settings: -More @{VICTORY_PANEL='1'}
 # -Log          also write the whole log to <data_dir>\logs\play-<date>-<time>.log (data_dir from
 #               victory.toml or VICTORY_DATA_DIR); -LogFile <path> writes it there instead. The log
@@ -38,6 +41,7 @@ param(
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'off',
     [switch]$FrameGen,
     [ValidateRange(2, 6)][int]$FrameGenX = 2,
+    [switch]$NvidiaDefaults,
     [hashtable]$More = @{},
     [switch]$Log,
     [string]$LogFile = '',
@@ -170,6 +174,37 @@ if ($Safe) {
     $settings.VICTORY_SUBMIT_FRAMES = '2'; $settings.VICTORY_SPARES_BY_HEADROOM = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($NvidiaDefaults -and $Safe) {
+    Write-Host '-NvidiaDefaults is left out with -Safe.'
+} elseif ($NvidiaDefaults) {
+    # What VIctory-NVIDIA's launcher (appsictory\src\play.rs at 9ce3cf9) sets and this script does
+    # not, of the switches this fork's code reads with another default. The saved settings and -More
+    # still go over them.
+    # Shader writes into card copies of write-combined title memory of 1 MiB and more stay on the
+    # card: no compare, fetch or merge back.
+    $settings.VICTORY_WC_NO_BACK = '1'
+    # Title buffers from 64 KiB up get a copy in the card's memory (unset: sized from the budget).
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    # Textures picked by index: 16 ms a pass for making and staging them (250), no triple allowance
+    # for a backlog, no blocks made ahead to age, uploads decided at submission and copied on the
+    # list's prelude, and textures the host writes left out of the pass's queue.
+    $settings.VICTORY_TEXTURE_STAGE_MS = '16'; $settings.VICTORY_TEXTURE_CATCHUP = '0'
+    $settings.VICTORY_RIPE_BLOCKS = '0'; $settings.VICTORY_PRELUDE_UPLOADS = '1'
+    $settings.VICTORY_QUEUE_HOST_TEXTURES = '0'
+    # A later table read in the same frame takes a slot written after the frame's first read.
+    $settings.VICTORY_TABLED_REREAD = '1'
+    # The heaps' records: a submission's round begins as soon as it holds the submission lock, and
+    # each thread is handed fewer pages at a time.
+    $settings.VICTORY_HEAP_SYNC_FIRST = '1'; $settings.VICTORY_SYNC_FINE = '1'
+    # The light stand-in: the air scatters at most 1.5 times the light around (a change of the
+    # picture, not of speed).
+    $settings.VICTORY_AMBIENT_AIR = '1.5'
+    # Not taken: VICTORY_TEXTURE_ROOM_PERCENT with frame generation (VICTORY_FRAMEGEN_ROOM_MB keeps
+    # that room here already), its memory switches (VICTORY_SLOT_EVICT, VICTORY_ALLOCATOR_TRIM,
+    # VICTORY_BUDGET_PACK: unplayed here, give them with -More), VICTORY_LEAVE_OUT and the switches
+    # this fork does not have.
+    Write-Host '-NvidiaDefaults: the switches of VIctory-NVIDIA''s launcher are set as well.'
+}
 # The title takes its output size from its own settings (3840x2160 in a Series X dump), not from
 # the display mode it is told of: VICTORY_OUTPUT patches it to one of the sizes it has a mode for.
 $output = $Display

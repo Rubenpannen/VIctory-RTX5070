@@ -62,7 +62,8 @@ switches (clearing other `VICTORY_*` vars except the path ones) and runs
 `-Safe` drops the newest switches, `-RayTracing` sets `VICTORY_BVH_BUILDER=1`, `-Display` sets
 the title's output size (`VICTORY_OUTPUT`, 2560x1440 by default), `-RenderScale` its upscaler's scale
 (`VICTORY_RENDER_SCALE`, 1.0 by default), `-Console series-x|series-s` the console the title sees,
-`-Build diag|release` the binary, `-More @{...}` adds switches, and `-Log` / `-LogFile <path>` also
+`-Build diag|release` the binary, `-NvidiaDefaults` adds the switches VIctory-NVIDIA's launcher sets
+and this script does not (not with `-Safe`), `-More @{...}` adds switches, and `-Log` / `-LogFile <path>` also
 write the log to a file (under the data folder by default; it holds the title's data, so the script
 refuses a path inside the repo). `-Dlss <mode>`, `-FrameGen` and `-FrameGenX 2..6` turn on DLSS and
 frame generation (`docs/dlss.md`). In the title, F3 shows the stats panel and F1 the settings menu,

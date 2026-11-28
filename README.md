@@ -156,6 +156,8 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+`-NvidiaDefaults` also sets the switches VIctory-NVIDIA's launcher sets and this
+script does not (listed in the script with what each does; not measured on this PC yet).
 The title renders for 2560x1440 at full scale by default (`VICTORY_OUTPUT=2560x1440`,
 `VICTORY_RENDER_SCALE=1.0`; left alone it renders 2560x1440 and scales it up to
 3840x2160). `-Display` picks the output size: `1920x1080`, `1664x936`, `1280x720`,
