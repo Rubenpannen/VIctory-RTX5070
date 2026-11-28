@@ -1,6 +1,6 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
 //! `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`, `VICTORY_UPSCALER`; each off
-//! without it): places
+//! without it) and its FidelityFX path for DLSS (when the app asks): places
 //! in the title's code changed at load, each compared byte for byte first
 //! and left alone, said so, if it differs (another build of the title).
 //!
@@ -34,9 +34,40 @@
 //!   2/3 on Series S; `VICTORY_FFX_SCALE` points its two loads at a constant
 //!   in its padding (as pull request #53 did). That one is not safe: at 0.5
 //!   on Series S (run res-6) FidelityFX's jitter phase count came back 0 and
-//!   the title divided by it (+0x28f03e8) 49 s in.
+//!   the title divided by it (+0x28f03e8) 49 s in. That may be the cause
+//!   VIctory-NVIDIA found in 4fcaebd (unverified here): the shipping FSR4
+//!   makes its context at [`SHIPPING_FSR4_RENDER`] in and
+//!   [`SHIPPING_FSR4_OUTPUT`] out only, 960x540 fails its creation, and the
+//!   title, which does not look at the result, divides by zero at its first
+//!   upscaling.
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **The FidelityFX path for DLSS.** With DLSS or frame generation
+//!   available (NVIDIA Streamline loaded, `VICTORY_DLSS=1` /
+//!   `VICTORY_FRAMEGEN=1`) or `VICTORY_FSR_PATH=1`, the app passes an
+//!   [`Upscaler`] (`VICTORY_DLSS_MODE`'s FidelityFX quality mode and scale)
+//!   and three places are changed together, or none if one differs: the
+//!   picker returns 7 on either console (Series S picks it already when its
+//!   flag is set); FidelityFX's render size method notes the mode at +0x90
+//!   of the upscaler (`[r14+90h]`, where the title notes the console
+//!   check's result: 0 on Series X, 1, quality, on Series S) and takes the
+//!   scaled branch, whose load reads the mode's scale from the padding (as
+//!   `VICTORY_FFX_SCALE` writes it); the title's own upscaler's scale is the
+//!   mode's too, as the stock image pairs the two (2/3 each). The title's
+//!   upscale dispatches then reach `victory_hle::modules::fidelityfx`, where
+//!   DLSS takes them. `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE` and
+//!   `VICTORY_UPSCALER` are left out then (said so). Without Streamline (its
+//!   DLLs missing, a card it does not serve) and without `VICTORY_FSR_PATH`
+//!   nothing of this is changed. The title's own FSR4 (no DLSS) makes its
+//!   context only at the shipping sizes ([`SHIPPING_FSR4_RENDER`]), so
+//!   `VICTORY_FSR_PATH=1` alone is expected to run only where the title asks
+//!   for those (a 1920x1080 output at the quality scale); at other sizes the
+//!   title may divide by zero at its first upscaling, as above. From VIctory-NVIDIA d11233a and 4fcaebd
+//!   (readmet3xt-lab; there from DexNom's fork, `prepare_fsr_4k`), which
+//!   change the same instructions in the file before it is mapped. A
+//!   possible later place: the Settings menu's viewport load (+0x58048d4),
+//!   which reads the 4K interface size where VIctory-NVIDIA's 1440p output
+//!   points it at the display mode's.
 //! - **Interface plane.** On Series X the interface is laid out in 4K
 //!   pixels: the settings menu, subtitles and button prompts keep their 4K
 //!   size at a smaller output (at 1080p twice too large, cut off at the
@@ -341,6 +372,58 @@ pub fn ffx_scale_code(scale: f32) -> Vec<u8> {
     c
 }
 
+/// Where in [`FFX_SCALE`] the console check's result is noted as the
+/// FidelityFX quality mode and picks the branch (14 bytes): `movzx eax, al ;
+/// mov [r14+90h], eax ; test al, al ; jne` to the scaled load.
+pub const FFX_MODE_AT: usize = 0x1a;
+/// Where in [`FFX_SCALE`] the scaled branch (Series S) loads its scale.
+pub const FFX_SCALED_LOAD: usize = 0x32;
+
+/// What goes at [`FFX_SCALE`] for the FidelityFX path at `scale` with
+/// `ffx_mode` noted: [`ffx_scale_code`]'s loads of `scale`, and at
+/// [`FFX_MODE_AT`] `mov eax, ffx_mode ; mov [r14+90h], eax ; jmp` to the
+/// scaled load (the console check before it still runs; its result is not
+/// used).
+pub fn ffx_upscaler_code(ffx_mode: u32, scale: f32) -> Vec<u8> {
+    let mut c = ffx_scale_code(scale);
+    let mut noted = vec![0xb8];
+    noted.extend(ffx_mode.to_le_bytes());
+    noted.extend([0x41, 0x89, 0x86, 0x90, 0x00, 0x00, 0x00]); // mov [r14+90h], eax
+    let end = FFX_MODE_AT + noted.len() + 2;
+    noted.extend([0xeb, (FFX_SCALED_LOAD - end) as u8]); // jmp to the scaled load
+    c[FFX_MODE_AT..end].copy_from_slice(&noted);
+    c
+}
+
+/// The largest render and output sizes the title's shipping FSR4 makes an
+/// upscaler context at: it carries only the Series S's fixed-resolution
+/// quality tables. Other sizes fail the creation ("Shipping FSR4
+/// configuration mismatch": the output must be 1920x1080, the render size
+/// 1280x720 for a tight allocation or 1920x1080 for the legacy one), and
+/// the title, which does not look at the result, divides by zero at its
+/// first upscaling (VIctory-NVIDIA 4fcaebd, readmet3xt-lab, on a 4070
+/// SUPER). With DLSS on, `victory_hle::modules::fidelityfx` makes the
+/// context at these and gives DLSS the sizes asked.
+pub const SHIPPING_FSR4_RENDER: [u32; 2] = [1280, 720];
+/// See [`SHIPPING_FSR4_RENDER`].
+pub const SHIPPING_FSR4_OUTPUT: [u32; 2] = [1920, 1080];
+
+/// The picker's FidelityFX.
+pub const FIDELITYFX: u32 = 7;
+
+/// The FidelityFX path the app asks for (DLSS, frame generation or
+/// `VICTORY_FSR_PATH=1`; see the module's notes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Upscaler {
+    /// What it is for, in the log (`dlss quality`, say).
+    pub name: &'static str,
+    /// The FidelityFX quality mode the title notes: 0 native AA, 1 quality,
+    /// 2 balanced, 3 performance, 4 ultra performance.
+    pub ffx_mode: u32,
+    /// The render size over the output size.
+    pub scale: f32,
+}
+
 /// `mov eax, kind ; ret`.
 pub fn picker_code(kind: u32) -> Vec<u8> {
     let mut c = vec![0xb8];
@@ -394,14 +477,34 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
     Patched::Done
 }
 
-/// Applies what the switches ask for; a line each in the log and on
-/// standard output.
+/// Applies what the switches ask for, and the FidelityFX path if `upscaler`
+/// is given; a line each in the log and on standard output. Whether the
+/// FidelityFX path was put in (all three of its places).
 ///
 /// # Safety
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(base: usize, size: usize, upscaler: Option<Upscaler>) -> bool {
+    // The FidelityFX path's three places, all or none.
+    let path_sites = [&PICKER, &FFX_SCALE, &OWN_SCALE];
+    let upscaler = upscaler.filter(|u| {
+        let differ: Vec<&str> = path_sites
+            .iter()
+            // SAFETY: the caller's promise.
+            .filter(|s| unsafe { matches(base, size, s) } != Patched::Done)
+            .map(|s| s.what)
+            .collect();
+        if !differ.is_empty() {
+            tracing::warn!(?differ, "resolution: the FidelityFX path is not patched in (another build?)");
+            println!(
+                "resolution: the FidelityFX path ({}) is not patched in, the bytes are not the ones expected at: {}; the title upscales as before",
+                u.name,
+                differ.join(", ")
+            );
+        }
+        differ.is_empty()
+    });
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         let plane_asked = asked_ui_plane((w, h));
@@ -431,20 +534,50 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
     }
-    if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
-    }
-    if let Some(s) = asked_ffx_scale() {
-        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
-    }
-    if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+    if let Some(u) = upscaler {
+        // The FidelityFX path sets the picker and both scales.
+        for switch in ["VICTORY_RENDER_SCALE", "VICTORY_FFX_SCALE", "VICTORY_UPSCALER"] {
+            if std::env::var_os(switch).is_some() {
+                tracing::warn!(switch, "resolution: left out for the FidelityFX path");
+                println!("resolution: {switch} is left out: the FidelityFX path ({}) sets the upscaler and its scale", u.name);
+            }
+        }
+    } else {
+        if let Some(s) = asked_render_scale() {
+            asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        }
+        if let Some(s) = asked_ffx_scale() {
+            asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
+        }
+        if let Some(kind) = asked_upscaler() {
+            asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        }
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
         report(site, done, &value);
     }
+    let Some(u) = upscaler else {
+        return false;
+    };
+    let path = [
+        (&PICKER, picker_code(FIDELITYFX), format!("returns {FIDELITYFX}, {}", u.name)),
+        (
+            &FFX_SCALE,
+            ffx_upscaler_code(u.ffx_mode, u.scale),
+            format!("{}, mode {} noted, {}", u.scale, u.ffx_mode, u.name),
+        ),
+        (&OWN_SCALE, own_scale_code(u.scale), format!("{}, {}", u.scale, u.name)),
+    ];
+    let mut all = true;
+    for (site, code, value) in path {
+        // SAFETY: the caller's promise.
+        let done = unsafe { write(base, size, site, &code) };
+        report(site, done, &value);
+        all &= done == Patched::Done;
+    }
+    all
 }
 
 /// A line in the log and on standard output for a site written or not.
@@ -581,6 +714,39 @@ mod tests {
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    /// The FidelityFX path: the mode noted and a jump to the scaled load in
+    /// place of the console check's branch, which then reads the scale.
+    #[test]
+    fn the_fidelityfx_path_code() {
+        let b = FFX_SCALE.bytes;
+        // movzx eax, al ; mov [r14+90h], eax ; test al, al ; jne scaled.
+        assert_eq!(
+            b[FFX_MODE_AT..FFX_MODE_AT + 14],
+            [0x0f, 0xb6, 0xc0, 0x41, 0x89, 0x86, 0x90, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x75, 0x0a]
+        );
+        assert_eq!(FFX_MODE_AT + 14 + b[FFX_MODE_AT + 13] as usize, FFX_SCALED_LOAD);
+        assert_eq!(b[FFX_SCALED_LOAD..FFX_SCALED_LOAD + 4], [0xc5, 0xfa, 0x10, 0x05]);
+        for (mode, scale) in [(0, 1.0f32), (1, 2.0 / 3.0), (3, 0.5), (4, 1.0 / 3.0)] {
+            let c = ffx_upscaler_code(mode, scale);
+            assert_eq!(c.len(), b.len());
+            assert_eq!(c[FFX_MODE_AT], 0xb8, "mov eax, mode");
+            assert_eq!(c[FFX_MODE_AT + 1..FFX_MODE_AT + 5], mode.to_le_bytes());
+            assert_eq!(c[FFX_MODE_AT + 5..FFX_MODE_AT + 12], b[FFX_MODE_AT + 3..FFX_MODE_AT + 10]);
+            assert_eq!(c[FFX_MODE_AT + 12], 0xeb);
+            assert_eq!(FFX_MODE_AT + 14 + c[FFX_MODE_AT + 13] as usize, FFX_SCALED_LOAD);
+            let disp = i32::from_le_bytes(c[FFX_SCALED_LOAD + 4..FFX_SCALED_LOAD + 8].try_into().unwrap());
+            let slot = (FFX_SCALED_LOAD as i32 + 8 + disp) as usize;
+            assert_eq!(c[slot..slot + 4], scale.to_le_bytes(), "the scaled load reads the scale");
+            // Only the branch, the two displacements and the padding change.
+            let changed: Vec<usize> = (0..c.len()).filter(|&i| c[i] != b[i]).collect();
+            assert!(changed.iter().all(|&i| (FFX_MODE_AT..FFX_MODE_AT + 14).contains(&i)
+                || (0x2c..0x30).contains(&i)
+                || (0x36..0x3a).contains(&i)
+                || (0x64..0x68).contains(&i)));
+        }
+        assert_eq!(picker_code(FIDELITYFX), [0xb8, 7, 0, 0, 0, 0xc3]);
     }
 
     #[cfg(windows)]

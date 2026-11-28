@@ -2010,15 +2010,18 @@ pub(crate) fn room_percent() -> u64 {
 /// The line [`room`] weighs the card's use against, in bytes of a budget
 /// of `budget`: `VICTORY_TEXTURE_ROOM_PERCENT`'s share of it if set, else
 /// [`line_for`] it. `VICTORY_TEXTURE_ROOM_PERCENT=90` is the line as it
-/// was before. (From VIctory-NVIDIA ff5d931, readmet3xt-lab.)
+/// was before. (From VIctory-NVIDIA ff5d931, readmet3xt-lab.) Either is
+/// lowered by what frame generation is left while it is ready
+/// (`VICTORY_FRAMEGEN_ROOM_MB`, [`crate::streamline::room_kept`]).
 #[cfg(windows)]
 pub(crate) fn room_line(budget: u64) -> u64 {
     static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
+    let line = if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
         budget / 100 * room_percent()
     } else {
         line_for(budget)
-    }
+    };
+    line.saturating_sub(crate::streamline::room_kept())
 }
 
 /// The budget less what is left free for the host's own needs that are

@@ -74,6 +74,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_CARD_SPANS` | Measures how long the card itself works on our submissions, using its own timestamps, and logs it. *Diagnostics build only.* | off | 1 = on; unset/other = off |
 | `VICTORY_CARD_STEPS` | Does steps of a submission that read in-flight title memory on the card, in the flights' order, instead of on the CPU. *Set by `scripts\play.ps1`.* | 0 (off) | 1 = stage 1; 2 = stage 2; other = off |
 | `VICTORY_CARD_WINDOWS_MB` | Sets the most bytes of memory windows outside buffers that may have copies in the card's memory; `auto` sizes it from the card's budget. | 0 (none) | &lt;MiB, integer>; auto = 9 % of the budget, at most 1024 MiB (about 1,000 MiB on a 12 GB card) |
+| `VICTORY_CHECK_TEARDOWN` | Lets `victory upscaler-check` shut Streamline down at its end. *Diagnostics build only.* | on | 0 = not shut down; anything else = on |
 | `VICTORY_CLZERO_ASK` | Makes the console block-zero instruction ask Windows about memory every time instead of remembering answers per thread. | off (answers are remembered per thread) | 1 = ask Windows every time; other = remember |
 | `VICTORY_COMMITTED_QUERY` | Checks whether title pages are readable with VirtualQuery, as before, instead of the faster kernel page query. | off | 1 = on; unset/other = off |
 | `VICTORY_CONFIG` | Names the configuration file to use instead of ./victory.toml. | ./victory.toml | &lt;file path>; empty = unset |
@@ -101,6 +102,12 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_DIRECT_WRITES` | Writes into title memory with the kernel's own call instead of WriteProcessMemory, skipping its slow page query. | on | 0 = off; anything else (or unset) = on |
 | `VICTORY_DISPATCH_SPLIT` | Splits over-limit dispatches into pieces for 32-lane GPUs, as an experiment. | off | 1 = on; unset/other = off |
 | `VICTORY_DISPLAY_MODE` | Sets the display size the console reports to the title. | 3840x2160 | &lt;width>x&lt;height> in pixels, 640x360 to 7680x4320; out of range = default |
+| `VICTORY_DLSS` | NVIDIA DLSS takes the title's upscaling (docs/dlss.md): the title is put on its FidelityFX path and its upscales go to DLSS through NVIDIA Streamline; without the files or a card that has DLSS, nothing changes. *Set by `scripts\play.ps1`* (`-Dlss`). | off | 1 = on; unset/other = off |
+| `VICTORY_DLSS_JITTER` | Multiplies the jitter handed to DLSS, to find a sign or scale fix. *Diagnostics build only.* | 1,1 | &lt;x,y>, decimals |
+| `VICTORY_DLSS_MODE` | The DLSS mode, which sets the scene's render scale. *Set by `scripts\play.ps1`* (`-Dlss`). | quality | dlaa (or native) = 1.0; quality = 2/3; balanced = 0.58; performance = 1/2; ultraperformance = 1/3; other = refused with a message |
+| `VICTORY_DLSS_MV` | Multiplies the motion-vector scale handed to DLSS, to find a sign or scale fix. *Diagnostics build only.* | 1,1 | &lt;x,y>, decimals |
+| `VICTORY_DLSS_PRESET` | The DLSS model preset. | default (NVIDIA's choice) | default, e, f, j, k, l, m; other = refused with a message |
+| `VICTORY_DLSS_REACTIVE` | Gives DLSS the title's reactive mask. | on | 0 = not given; anything else = on |
 | `VICTORY_DSP_CONVOLVE` | Computes the audio DSP's mono convolutions of 1024-frame blocks, so TVs, phone calls and reverb are heard instead of silent. | on | 0 = off (the DSP's outputs are zeros, as before); anything else = on |
 | `VICTORY_DSP_GAIN` | Scales the computed DSP convolutions (the hardware's own scaling is not known). | 2 | &lt;factor, number> |
 | `VICTORY_DSTORAGE_HALF` | Makes a file-streaming queue submit itself once half full, as DirectStorage for PC does. | off | 1 = on; unset/other = off |
@@ -133,8 +140,14 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_FILL_TITLE` | Lets a small fill or buffer copy proceed without waiting for in-flight work when the title itself wrote that memory. | 0 (off) | 0 = off; 1 = on, also checks for title writes since the page was taken; 2 = on without that check |
 | `VICTORY_FIRSTLANE_OWN` | Makes the shader translator take the host wave's own first lane where the console reads its first lane. | off | 1 = on; unset or anything else = off |
 | `VICTORY_FIRST_HALF` | Lets the translator evaluate a first-half interpolation as the full pair when a first attempt at the shader was refused. | on | 0 = off; anything else or unset = on |
+| `VICTORY_FRAMEGEN` | DLSS frame generation (docs/dlss.md); needs DLSS on, `VICTORY_THIN=1` (or `VICTORY_ASYNC_SUBMIT=1`) and the interface plane (`VICTORY_UI_PLANE=1` at a `VICTORY_OUTPUT` smaller than 3840x2160), and is refused with a log line otherwise. *Set by `scripts\play.ps1`* (`-FrameGen`). | off | 1 = on; unset/other = off |
+| `VICTORY_FRAMEGEN_CYCLE` | Every N presents, asks frame generation for 2x, 4x, off and 6x in turn (an unattended test). *Diagnostics build only.* | 0 (off) | &lt;presents, integer> |
+| `VICTORY_FRAMEGEN_HUDLESS` | With frame generation, tags the scene plane (the frame without the interface, `VICTORY_UI_PLANE`) for it. | on | 0 = not tagged; anything else = on |
+| `VICTORY_FRAMEGEN_ROOM_MB` | Lowers the texture queue's room line by this much while frame generation is ready, for what frame generation allocates. | 1024 | &lt;MiB, integer>; 0 = not lowered |
+| `VICTORY_FRAMEGEN_X` | Frames shown per frame rendered with frame generation. *Set by `scripts\play.ps1`* (`-FrameGen`). | 2 | 2 to 6; 0 = made ready but off |
 | `VICTORY_FRAME_INTERVAL_MS` | Sets the title's frame interval, patched into the title's code and used by our frame clock. | not set (title's own) | &lt;milliseconds, decimal 0 to 1000>; 0 = no wait at all |
 | `VICTORY_FRESH_OPEN` | Leaves the host list made for a title's new list open for its next reset instead of closing it at once. | on | 0 = closed at once, as before; anything else = on |
+| `VICTORY_FSR_PATH` | Puts the title on its FidelityFX path at `VICTORY_DLSS_MODE`'s scale with its own FSR, without Streamline, to compare with DLSS (the title's FSR4 only works at 1280x720 in, 1920x1080 out). | off | 1 = on; unset/other = off |
 | `VICTORY_FULL_CARD_PASS` | When the card is full, holds back texture slots needing a new host copy and carries on with the slots behind them. | on | 0 = off; anything else or unset = on |
 | `VICTORY_GAME_DIR` | Sets the folder holding the title's files, overriding the one in victory.toml. | from victory.toml | &lt;folder path> |
 | `VICTORY_GPU_LOAD_MS` | Makes the title's four per-frame GPU timestamps report the given load, so its GPU time looks non-zero. | 0 (timestamps as they are) | &lt;milliseconds, integer> of GPU time to report per frame |
@@ -344,6 +357,9 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_STAGED_ASK_ALL` | Asks about every texture a pass over index-picked textures takes, through committed memory checks, instead of only some. | off | 1 = on; unset/anything else = off |
 | `VICTORY_STALE_TEXTURES` | Chooses when a view the title writes makes older views of other memory stale, so their host texture copies are refreshed. | from the start of the block of smallest levels | 0 = never; overlap = wherever spans overlap; anything else = default rule |
 | `VICTORY_STORE_BESIDE` | Lets the layer's own memcpy/memset replacements also handle the title's stores beside tracked memory, noticing them without a page fault. | off | 1 = on; unset/other = off |
+| `VICTORY_STREAMLINE_DIR` | The folder with NVIDIA Streamline's DLLs (each checked to be signed by NVIDIA before loading). *Kept by `scripts\play.ps1` from the window it runs in.* | &lt;data_dir>\nvidia-sdk\Streamline\bin\x64 (`scripts\get-nvidia-sdks.ps1` puts them there) | &lt;folder path> |
+| `VICTORY_STREAMLINE_LOG` | Writes Streamline's own verbose log into this folder. *Diagnostics build only.* | not set (no log) | &lt;folder path>; empty or 0 = no log |
+| `VICTORY_STREAMLINE_PRESENT` | With DLSS and no frame generation, our swap chain is Streamline's proxy of it, so that Streamline sees the presents. | off | 1 = on; unset/other = off |
 | `VICTORY_STREAM_NOTICE` | Tells the GPU side which bytes DirectStorage has just put into memory, so streamed data is picked up without scanning. | on | 0 = off; anything else = on |
 | `VICTORY_STREAM_PRIORITY` | Raises the title's below-normal streaming thread to above normal where it maps and submits, so it gets a core. | on | 0 = off; anything else = on |
 | `VICTORY_STRICT_JOINS` | Makes the shader translator stop on a value without a DXIL form at a join instead of silently turning it into zero. | off | any value (even empty) = on |
@@ -428,7 +444,7 @@ comment where a switch is read disagree, the comment is right.
 | `VICTORY_WAVE_OWN_BITS` | Accepts a wave OR where not every lane runs, where the lanes' own bits can be told apart. | on | 0 = off; anything else = on |
 | `VICTORY_WAVE_WHY` | Prints why a wave64 region was refused translation, by its LDS accesses. | off | any value = on |
 | `VICTORY_WAVE_WIDE` | Translates console wave64 programs as two host waves (wide form); unset widens only one narrow case. | unset: only one narrow case is widened | 1 = wide form on; 0 = never wide; unset = narrow case only |
-| `VICTORY_WAVE_WIDE_VOLUMETRIC` | The volumetric light's two tiled programs take the wave-wide form before any approximate one. Changes translations. | off | 1 = on (ignored while `VICTORY_WAVE_WIDE` is set); unset/other = off |
+| `VICTORY_WAVE_WIDE_VOLUMETRIC` | The volumetric light's two tiled programs and four more 64-thread LDS programs refused on RTX cards (VIctory-NVIDIA pull request 101) take the wave-wide form before any approximate one. Changes translations. | off | 1 = on (ignored while `VICTORY_WAVE_WIDE` is set); unset/other = off |
 | `VICTORY_WC_BAR` | Gives a write-combined title buffer one copy in card memory the CPU maps. | off | 1 = on; unset/other = off |
 | `VICTORY_WC_NO_BACK` | Leaves what shaders write in card copies of write-combined title memory on the card (no compare, fetch or merge back). | off | 1 = on; unset/other = off |
 | `VICTORY_WC_NO_BACK_MIN_KB` | The smallest copy `VICTORY_WC_NO_BACK` and `VICTORY_WC_BAR` apply to (smaller ones went near black in cutscenes). | 1024 | &lt;KiB, integer>; 0 = every copy |

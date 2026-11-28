@@ -484,6 +484,11 @@ pub fn emit(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        if why {
+            // (the digest names the program in the wave-wide list below)
+            // (From VIctory-NVIDIA pull request 101, ballsimulation.)
+            eprintln!("WAVE64-SHADER digest={:02x?}", c.digest);
+        }
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
@@ -563,6 +568,12 @@ pub fn emit(
         // Off by default until a run here has shown which form they take now (`VICTORY_WAVE_WHY`);
         // not with `VICTORY_WAVE_WIDE` set either way.
         // (From VIctory-NVIDIA eeb17cc, readmet3xt-lab.)
+        // The same switch takes four more programs of that shape this way, refused on RTX
+        // cards ("no wave32 lowering", pipeline hashes 5e3dd99e0f067aee, ae0deeafe219c15c,
+        // a10179ab7eda0dc3, 57f1b81de55c2842): groups of 64, an LDS read and write in one
+        // lane-branch region; widened they translate (4, 5, 15 and 15 branches taken
+        // wave-wide). What they draw is not known. (From VIctory-NVIDIA pull request 101,
+        // ballsimulation, unmerged there: about 30 minutes played on an RTX 4070, Series S.)
         let volumetric = wide_option.is_none()
             && std::env::var_os("VICTORY_WAVE_WIDE_VOLUMETRIC").is_some_and(|v| v == "1")
             && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
@@ -570,6 +581,10 @@ pub fn emit(
                 c.digest,
                 [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+                    | [0xb3, 0x0a, 0x8c, 0x4e, 0xe5, 0x8b, 0x40, 0x88, 0x85, 0x61, 0xd5, 0x2b, 0x15, 0xa8, 0x0a, 0xe2]
+                    | [0x27, 0x7f, 0x65, 0x9e, 0x06, 0xf0, 0x2b, 0xa2, 0x68, 0x5a, 0xff, 0x1d, 0x0d, 0xf0, 0x3f, 0x5e]
+                    | [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
+                    | [0xe4, 0x91, 0x94, 0x2b, 0xdc, 0xb5, 0x01, 0x47, 0x3a, 0x9a, 0x4a, 0x00, 0xa0, 0xbd, 0x59, 0x33]
             );
         let wide_on = wide_option.as_ref().is_some_and(|v| v == "1") || volumetric;
         // Unset, one narrower case is widened all the same: a console compute program
@@ -1241,9 +1256,11 @@ mod tests {
         use std::ffi::OsString;
         let key = |a: Option<&str>, b: Option<&str>| {
             let mut out = Vec::new();
-            super::switch_values(&mut out, "VICTORY_A,VICTORY_B", |name| match name {
-                "VICTORY_A" => a.map(OsString::from),
-                "VICTORY_B" => b.map(OsString::from),
+            // (Names of no switch, and not spelled as one: `build.rs` takes every
+            // quoted `VICTORY_` name here for a switch of the translator.)
+            super::switch_values(&mut out, "TEST_A,TEST_B", |name| match name {
+                "TEST_A" => a.map(OsString::from),
+                "TEST_B" => b.map(OsString::from),
                 other => panic!("{other} is not in the list"),
             });
             out

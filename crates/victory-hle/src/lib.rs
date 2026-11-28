@@ -36,6 +36,11 @@ pub use victory_gpu::port_descriptors;
 /// reserve first thing (from VIctory-NVIDIA e69e39c).
 #[cfg(windows)]
 pub use victory_gpu::reserve_upload_space;
+/// DLSS and frame generation through NVIDIA Streamline (`VICTORY_DLSS`,
+/// `VICTORY_FRAMEGEN`), for the launcher (from VIctory-NVIDIA d11233a,
+/// readmet3xt-lab).
+#[cfg(windows)]
+pub use victory_gpu::streamline;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

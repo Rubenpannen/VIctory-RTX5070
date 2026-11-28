@@ -9,7 +9,13 @@
 # -RenderScale  the title's own upscaler's scale (VICTORY_RENDER_SCALE, Series X): 1.0 (the
 #               default: it renders at the output size), 0.5 to 1.0, or 'title' (its own 2/3)
 # -Console      the console the title sees: series-x (the default) or series-s
-# -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Dlss         NVIDIA DLSS takes the title's upscaling (docs/dlss.md; NVIDIA's files from
+#               scripts\get-nvidia-sdks.ps1): off (the default), dlaa, quality, balanced,
+#               performance; the scene renders at that mode's scale (-RenderScale only if DLSS
+#               turns out not to be available)
+# -FrameGen     DLSS frame generation as well (needs -Dlss, not with -Safe); -FrameGenX 2 to 6:
+#               frames shown per frame rendered (2 by default)
+# -More        other settings: -More @{VICTORY_PANEL='1'}
 # -Log          also write the whole log to <data_dir>\logs\play-<date>-<time>.log (data_dir from
 #               victory.toml or VICTORY_DATA_DIR); -LogFile <path> writes it there instead. The log
 #               holds the title's data, so it may not be inside this repository (docs/asset-policy.md).
@@ -23,6 +29,9 @@ param(
     [string]$Display = '2560x1440',
     [ValidatePattern('^(title|0\.[5-9]\d*|1(\.0*)?)$')][string]$RenderScale = '1.0',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'off',
+    [switch]$FrameGen,
+    [ValidateRange(2, 6)][int]$FrameGenX = 2,
     [hashtable]$More = @{},
     [switch]$Log,
     [string]$LogFile = ''
@@ -62,9 +71,23 @@ if ($Display -eq 'monitor') {
     if ($size -notin $modes) { Write-Host "This screen ($size) is no size the title has a mode for: $output." }
 }
 if ($output -ne 'console') { $settings.VICTORY_OUTPUT = $output }
+if ($FrameGen -and $Dlss -eq 'off') { Write-Host '-FrameGen needs -Dlss (frame generation alone stops the title).'; exit 1 }
+if ($FrameGen -and $Safe) { Write-Host '-FrameGen needs the line of submissions -Safe leaves out (VICTORY_THIN).'; exit 1 }
+if ($FrameGen -and $output -in 'console', '3840x2160') {
+    # The frame without the interface is the scene plane, which a 3840x2160 output does not have.
+    Write-Host '-FrameGen needs an output smaller than 3840x2160 (the interface on a plane of its own).'; exit 1
+}
+if ($Dlss -ne 'off') {
+    # DLSS sets the scene's size; the render scale below is left out then (said in the log), and
+    # applies only if DLSS is not available (NVIDIA's files missing, another card).
+    $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss
+    if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = "$FrameGenX" }
+}
 if ($RenderScale -ne 'title') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
 $shown = if ($output -eq 'console') { 'the title''s own (3840x2160)' } else { $output }
-$scale = if ($RenderScale -eq 'title') { 'its own 2/3' } else { $RenderScale }
+$scale = if ($Dlss -ne 'off') {
+    "DLSS $Dlss" + $(if ($FrameGen) { ", frame generation ${FrameGenX}x" } else { '' })
+} elseif ($RenderScale -eq 'title') { 'its own 2/3' } else { $RenderScale }
 Write-Host "Output size: $shown; render scale: $scale"
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
@@ -72,7 +95,7 @@ $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }

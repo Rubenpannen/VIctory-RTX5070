@@ -53,6 +53,81 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): NVIDIA
+    // Streamline is loaded before anything of the title or the host GPU, and
+    // fails soft; only if it offers one of them does the title render through
+    // its FidelityFX path (`victory_game::resolution::apply_asked`), whose
+    // upscalings DLSS takes over (`victory_hle::modules::fidelityfx`). Its
+    // files are looked for in <data_dir>\nvidia-sdk\Streamline\bin\x64
+    // (scripts\get-nvidia-sdks.ps1) unless VICTORY_STREAMLINE_DIR names
+    // another folder. (From VIctory-NVIDIA d11233a, readmet3xt-lab.)
+    use victory_hle::streamline;
+    let streamline_dir = cfg.data_dir.join(r"nvidia-sdk\Streamline\bin\x64");
+    let asked = streamline::Asked::from_env(streamline_dir).map_err(anyhow::Error::msg)?;
+    let available = streamline::init(&asked);
+    // Streamline shut down when the run ends, however it ends (nothing if it
+    // was not loaded). Not on the title's own exit (`lifecycle`, which ends
+    // the process at once): the shutdown waits for the card and takes the
+    // presenter while other threads may still be presenting, and a hang there
+    // is worse than the fail-fast VIctory-NVIDIA saw at exit without it.
+    struct ShutDown;
+    impl Drop for ShutDown {
+        fn drop(&mut self) {
+            victory_hle::streamline::shutdown();
+        }
+    }
+    let _streamline = ShutDown;
+    // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
+    // scale with its own FidelityFX upscaling, no Streamline: DLSS's
+    // comparison, and on Series X what that path alone looks like and costs.
+    // Off without it. The title's own FSR4 makes its upscaler only at the
+    // shipping sizes (`victory_game::resolution::SHIPPING_FSR4_RENDER`): at
+    // other output sizes the title may divide by zero at its first
+    // upscaling. (From VIctory-NVIDIA 24d6bbb, readmet3xt-lab.)
+    let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
+    let upscaler = (available.dlss || available.framegen || fsr_path).then(|| {
+        let mode = asked.mode;
+        victory_game::resolution::Upscaler {
+            name: mode.name(),
+            ffx_mode: u32::from(mode.ffx_mode()),
+            scale: mode.scale(),
+        }
+    });
+    {
+        use victory_game::resolution::{SHIPPING_FSR4_OUTPUT, SHIPPING_FSR4_RENDER};
+        victory_hle::modules::fidelityfx::set_shipping_sizes(
+            SHIPPING_FSR4_RENDER,
+            SHIPPING_FSR4_OUTPUT,
+        );
+    }
+    let state = |on: bool, wanted: bool| {
+        if on {
+            "on"
+        } else if wanted {
+            "asked, not available"
+        } else {
+            "off"
+        }
+    };
+    if asked.any() {
+        println!(
+            "upscaling      DLSS {}, frame generation {}{}",
+            state(available.dlss, asked.dlss),
+            state(available.framegen, asked.framegen),
+            upscaler
+                .map(|u| format!(", scene at the {} scale ({})", u.name, u.scale))
+                .unwrap_or_default()
+        );
+    }
+    if fsr_path && !(available.dlss || available.framegen) {
+        let [rw, rh] = victory_game::resolution::SHIPPING_FSR4_RENDER;
+        let [ow, oh] = victory_game::resolution::SHIPPING_FSR4_OUTPUT;
+        println!(
+            "upscaling      the title's own FidelityFX at the {} scale ({}, VICTORY_FSR_PATH=1); its FSR4 makes an upscaler only at {rw}x{rh} in, {ow}x{oh} out",
+            asked.mode.name(),
+            asked.mode.scale()
+        );
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -167,7 +242,11 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The executable's FidelityFX calls go through ours when DLSS or frame
+    // generation is on (bound as before otherwise); the title's DLLs above
+    // are bound without it, as in VIctory-NVIDIA d11233a.
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -210,12 +289,19 @@ pub fn run(
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
+    // VICTORY_UPSCALER; each off without it), and the FidelityFX path for
+    // DLSS, frame generation or VICTORY_FSR_PATH=1 (which those yield to).
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_game::resolution::apply_asked(image.base(), size) };
+        let path = unsafe { victory_game::resolution::apply_asked(image.base(), size, upscaler) };
+        if let Some(u) = upscaler.filter(|_| path) {
+            println!(
+                "upscaling      the scene at {} of the output through the title's FidelityFX path ({})",
+                u.scale, u.name
+            );
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
