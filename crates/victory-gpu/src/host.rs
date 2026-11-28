@@ -896,6 +896,49 @@ fn preparing_take_back(count: &std::sync::atomic::AtomicU64, n: u64) {
 /// For the memory line: against what is alive, they show what was let go.
 pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// The card's own buffers of [`MADE`] by the place in our code that asked
+/// for each (its file and line), with their number and bytes: the memory
+/// line's count says how many were made, not by what. (In the A/B run of
+/// 2026-11-28, 2 to 7 a frame of about 64 KiB were made that the pool of
+/// `VICTORY_BETWEEN_POOL` did not cover, and nothing told which path's.)
+#[allow(clippy::type_complexity)]
+static CARD_ASKED: Mutex<Vec<(&'static std::panic::Location<'static>, u64, u64)>> = Mutex::new(Vec::new());
+
+/// A card buffer of `size` bytes is made for the caller at `at`. Beside a
+/// creation of about a millisecond: the lock and the look cost nothing.
+fn card_asked(at: &'static std::panic::Location<'static>, size: u64) {
+    let mut asked = CARD_ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    match asked.iter_mut().find(|(a, ..)| a.file() == at.file() && a.line() == at.line()) {
+        Some((_, count, bytes)) => {
+            *count += 1;
+            *bytes += size;
+        }
+        None => asked.push((at, 1, size)),
+    }
+}
+
+/// With the memory line: the card buffers made since the start by where
+/// they were asked for, the most first. Nothing while none was made.
+pub(crate) fn card_asked_line() {
+    let mut asked = CARD_ASKED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if asked.is_empty() {
+        return;
+    }
+    asked.sort_by_key(|&(_, count, _)| std::cmp::Reverse(count));
+    let by: Vec<String> = asked
+        .iter()
+        .take(12)
+        .map(|(at, count, bytes)| {
+            let file = at.file().rsplit(['/', '\\']).next().unwrap_or_default();
+            format!("{file}:{} {count} ({} MB)", at.line(), bytes >> 20)
+        })
+        .collect();
+    tracing::info!(
+        "memory, card buffers made since the start by where they were asked for (file:line, number, bytes): {}",
+        by.join("; ")
+    );
+}
+
 /// What of that is alive now, for the memory line (`MADE` counts what was
 /// ever made: 42,607 upload buffers, 77.9 GB, in five minutes of run 60,
 /// and nothing said how many were alive): host lists; the lists' scratch
@@ -10932,10 +10975,12 @@ impl Host {
     /// A buffer in the card's own memory that the CPU maps, shaders read and
     /// (with `written`) may write. The CPU should only write it: a read of the
     /// mapping crosses the bus a few bytes at a time.
+    #[track_caller]
     pub(crate) fn mapped_card_buffer(&self, size: u64, written: bool) -> Option<(ID3D12Resource, *mut u8)> {
         if !self.mapped_card_memory() {
             return None;
         }
+        card_asked(std::panic::Location::caller(), size);
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10991,7 +11036,9 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        card_asked(std::panic::Location::caller(), size);
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {

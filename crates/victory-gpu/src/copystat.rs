@@ -936,6 +936,7 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    crate::host::card_asked_line();
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
